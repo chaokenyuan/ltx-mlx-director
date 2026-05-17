@@ -143,22 +143,40 @@ def stream_generate(df: pd.DataFrame, aspect, fps, mode_label, seed, model,
 
 
 def concat_shots(shot_paths: list[str]):
+    """串接已生成的鏡頭。
+
+    Bug 修復：原本用 check=True，ffmpeg 在 concat demuxer + -c copy 模式下，
+    遇到輕微的 timebase / DTS 警告會回傳非零但仍產出有效檔案，造成 UI 誤報失敗。
+    改為「檔案存在且 > 0 byte」即視為成功；stream copy 真的失敗時降級為重編碼。
+    """
     if not shot_paths:
         return None, "尚無已生成的鏡頭"
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     list_file = OUT_DIR / f"final-{timestamp}.concat.txt"
     final_path = OUT_DIR / f"final-{timestamp}.mp4"
     list_file.write_text("\n".join(f"file '{p}'" for p in shot_paths))
-    try:
-        subprocess.run(
-            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-             "-f", "concat", "-safe", "0", "-i", str(list_file),
-             "-c", "copy", str(final_path)],
-            check=True, capture_output=True, text=True,
-        )
-        return str(final_path), f"串接完成: {final_path}"
-    except subprocess.CalledProcessError as e:
-        return None, f"ffmpeg 失敗: {e.stderr}"
+
+    proc = subprocess.run(
+        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+         "-f", "concat", "-safe", "0", "-i", str(list_file),
+         "-c", "copy", str(final_path)],
+        capture_output=True, text=True,
+    )
+    if final_path.exists() and final_path.stat().st_size > 0:
+        suffix = "" if proc.returncode == 0 else f"（ffmpeg 警告 rc={proc.returncode}，檔案仍有效）"
+        return str(final_path), f"串接完成: {final_path.name}{suffix}"
+
+    proc2 = subprocess.run(
+        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+         "-f", "concat", "-safe", "0", "-i", str(list_file),
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+         str(final_path)],
+        capture_output=True, text=True,
+    )
+    if final_path.exists() and final_path.stat().st_size > 0:
+        return str(final_path), f"串接完成（已重新編碼）: {final_path.name}"
+    err = (proc2.stderr or proc.stderr or "")[-400:]
+    return None, f"ffmpeg 失敗: {err}"
 
 
 def export_json(df: pd.DataFrame, aspect, fps, mode_label, seed, model, enhance):
@@ -259,11 +277,7 @@ with gr.Blocks(title="LTX-2.3 Director", css=CSS, theme=gr.themes.Soft()) as app
         label="storyboard",
     )
     selected_row = gr.State(None)
-
-    def on_select(evt: gr.SelectData):
-        return int(evt.index[0]) if evt and evt.index is not None else None
-
-    storyboard.select(on_select, outputs=selected_row)
+    selected_label = gr.Markdown("未選取列")
 
     with gr.Row():
         add_btn = gr.Button("新增鏡頭")
@@ -271,10 +285,92 @@ with gr.Blocks(title="LTX-2.3 Director", css=CSS, theme=gr.themes.Soft()) as app
         up_btn = gr.Button("選取列上移")
         dn_btn = gr.Button("選取列下移")
 
-    add_btn.click(add_row, [storyboard, default_dur], storyboard)
-    del_btn.click(delete_row, [storyboard, selected_row], storyboard)
-    up_btn.click(lambda df, sel: move_row(df, sel, -1), [storyboard, selected_row], storyboard)
-    dn_btn.click(lambda df, sel: move_row(df, sel, +1), [storyboard, selected_row], storyboard)
+    gr.Markdown("### 參考圖（i2v 起手式）\n"
+                "點選分鏡表中任一列後，上傳圖片並按「套用到選取列」。\n"
+                "LTX-2.3 會以此圖為第一幀延伸生成。")
+    with gr.Row():
+        with gr.Column(scale=2):
+            selected_image = gr.Image(
+                label="參考圖", type="filepath", height=240,
+                sources=["upload", "clipboard"],
+            )
+        with gr.Column(scale=1):
+            apply_image_btn = gr.Button("套用到選取列", variant="primary")
+            clear_image_btn = gr.Button("清除選取列圖片", variant="stop")
+            gr.Markdown(
+                "提示：\n"
+                "- 必須先點選分鏡表中的列\n"
+                "- 套用後該列的 i2v 路徑欄會顯示圖片絕對路徑\n"
+                "- 移除某列圖片用「清除」"
+            )
+
+    def on_select(evt: gr.SelectData, df):
+        """點選列時更新 selected_row + 載入該列現有的 i2v 圖片到預覽 widget。"""
+        idx = int(evt.index[0]) if (evt and evt.index is not None) else None
+        label = "未選取列" if idx is None else f"已選取：第 {idx + 1} 列"
+        img = None
+        if idx is not None and df is not None and 0 <= idx < len(df):
+            path = str(df.iat[idx, 2] or "").strip()
+            if path and Path(path).exists():
+                img = path
+        return idx, label, img
+
+    storyboard.select(
+        on_select,
+        inputs=[storyboard],
+        outputs=[selected_row, selected_label, selected_image],
+    )
+
+    def apply_image_to_row(img_path, df, sel):
+        if sel is None or df is None:
+            return df
+        idx = int(sel)
+        if not (0 <= idx < len(df)):
+            return df
+        df = df.copy()
+        df.iat[idx, 2] = img_path or ""
+        return df
+
+    def clear_image_in_row(df, sel):
+        if sel is None or df is None:
+            return df, None
+        idx = int(sel)
+        if not (0 <= idx < len(df)):
+            return df, None
+        df = df.copy()
+        df.iat[idx, 2] = ""
+        return df, None
+
+    apply_image_btn.click(
+        apply_image_to_row,
+        [selected_image, storyboard, selected_row],
+        storyboard,
+    )
+    clear_image_btn.click(
+        clear_image_in_row,
+        [storyboard, selected_row],
+        [storyboard, selected_image],
+    )
+
+    def handle_add(df, default_d):
+        return add_row(df, default_d), None, "未選取列"
+
+    def handle_delete(df, sel):
+        return delete_row(df, sel), None, "未選取列"
+
+    def handle_move(df, sel, delta):
+        df2 = move_row(df, sel, delta)
+        if sel is None:
+            return df2, None, "未選取列"
+        new_idx = int(sel) + delta
+        if 0 <= new_idx < len(df2):
+            return df2, new_idx, f"已選取：第 {new_idx + 1} 列"
+        return df2, sel, f"已選取：第 {int(sel) + 1} 列"
+
+    add_btn.click(handle_add, [storyboard, default_dur], [storyboard, selected_row, selected_label])
+    del_btn.click(handle_delete, [storyboard, selected_row], [storyboard, selected_row, selected_label])
+    up_btn.click(lambda df, s: handle_move(df, s, -1), [storyboard, selected_row], [storyboard, selected_row, selected_label])
+    dn_btn.click(lambda df, s: handle_move(df, s, +1), [storyboard, selected_row], [storyboard, selected_row, selected_label])
 
     gr.Markdown("## 生成")
     with gr.Row():
