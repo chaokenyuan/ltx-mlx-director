@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Output / cache
+output/
+*.mp4
+*.log
+*.concat.txt
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
