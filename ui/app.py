@@ -63,6 +63,42 @@ def make_initial_df() -> pd.DataFrame:
     )
 
 
+def get_audio_duration(path: Path) -> float:
+    """用 ffprobe 取得音檔秒數；失敗回 0.0。"""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, check=True, timeout=10,
+        )
+        return float(r.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+def adjust_duration_to_narration(seconds: float, narration: str,
+                                  voice: str, tmpdir: Path,
+                                  base_name: str) -> tuple[float, Path | None]:
+    """先跑 TTS 取得實際旁白秒數，若超過 seconds 則延長。
+
+    回傳 (調整後秒數對齊到 1+8N 幀後的秒數, 預生 aiff 路徑)。
+    若沒旁白或 TTS 失敗，回傳 (原秒數, None)。
+    """
+    import math
+    if not narration or not narration.strip():
+        return seconds, None
+    aiff = tmpdir / f"{base_name}.aiff"
+    if not tts_to_aiff(narration, voice, aiff):
+        return seconds, None
+    dur = get_audio_duration(aiff)
+    if dur <= 0:
+        return seconds, aiff
+    # 旁白比預設長 → 延長到 ceil(dur + 0.3) 秒（多 0.3 秒緩衝）
+    if dur > seconds:
+        return math.ceil(dur + 0.3), aiff
+    return seconds, aiff
+
+
 def tts_to_aiff(text: str, voice: str, out_path: Path) -> bool:
     """用 macOS `say` 把文字合成為 AIFF。回傳是否成功。"""
     if not text or not text.strip():
@@ -120,27 +156,29 @@ def mux_audio_subtitle(video_in: Path, audio_in: Path | None,
 
 
 def post_process_shot(shot_video: Path, narration: str, duration: float,
-                       voice: str, burn_subtitle: bool) -> tuple[Path, str]:
+                       voice: str, burn_subtitle: bool,
+                       pre_audio: Path | None = None) -> tuple[Path, str]:
     """為單鏡頭做 TTS + 字幕後處理。
 
-    回傳 (最終影片路徑, log 訊息)。
-    若沒有旁白也沒燒字幕，直接回原檔。
+    pre_audio 為預先產生的 TTS aiff（如已在 pipeline 中先跑過以取得長度）。
+    若提供且存在，跳過 TTS 直接複用。
     """
     if not narration or not narration.strip():
         return shot_video, "(無旁白，跳過後處理)"
 
     tmpdir = shot_video.parent
     base = shot_video.stem
-    aiff = tmpdir / f"{base}.aiff"
+    aiff = pre_audio if (pre_audio and pre_audio.exists()) else tmpdir / f"{base}.aiff"
     srt = tmpdir / f"{base}.srt"
     final = tmpdir / f"{base}_av.mp4"
 
     msgs = []
-    audio_ok = tts_to_aiff(narration, voice, aiff)
-    if audio_ok:
-        msgs.append(f"TTS({voice})")
+    if pre_audio and pre_audio.exists():
+        audio_ok = True
+        msgs.append(f"TTS({voice}, 預生)")
     else:
-        msgs.append("TTS 失敗")
+        audio_ok = tts_to_aiff(narration, voice, aiff)
+        msgs.append(f"TTS({voice})" if audio_ok else "TTS 失敗")
 
     if burn_subtitle:
         write_srt(narration, duration, srt)
@@ -296,6 +334,7 @@ def stream_story_pipeline(
     sec_per_shot: float, motion_prompt: str,
     aspect: str, fps, seed, model: str, enhance: bool,
     voice: str, burn_subtitle: bool, mode_label: str,
+    bgm_file_in=None, bgm_volume_in: float = -15.0,
     progress=gr.Progress(),
 ):
     """每行 = 一鏡頭。對每行：FLUX 出圖 → LTX i2v 雙錨 → TTS+字幕 → concat。"""
@@ -336,6 +375,17 @@ def stream_story_pipeline(
         log_lines.append(f"旁白: {narration[:80]}{'...' if len(narration) > 80 else ''}")
         yield "\n".join(log_lines[-40:]), completed, None, f"處理 Shot {shot_idx}/{total}"
 
+        # --- 0/3: TTS 預跑取得旁白長度，必要時延長鏡頭秒數 ---
+        actual_sec, pre_aiff = adjust_duration_to_narration(
+            sec_per_shot, narration, voice, OUT_DIR, f"{base}_{shot_idx:02d}",
+        )
+        if actual_sec != sec_per_shot:
+            log_lines.append(
+                f"[0/3] 旁白較長，鏡頭秒數 {sec_per_shot}s → {actual_sec}s"
+            )
+            yield "\n".join(log_lines[-40:]), completed, None, \
+                  f"Shot {shot_idx}: 延長為 {actual_sec}s"
+
         # --- 1/3: FLUX 靜圖 ---
         img_path = OUT_DIR / f"{base}_{shot_idx:02d}.png"
         img_prompt = f"{style_prompt}. {narration}"
@@ -365,7 +415,7 @@ def stream_story_pipeline(
         yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: 動畫中"
 
         ltx_cmd, _i2v_lock = build_cmd(
-            motion, sec_per_shot, str(img_path),
+            motion, actual_sec, str(img_path),
             aspect, int(fps), mode_label,
             base_seed + i * 17, model, enhance, vid_path,
         )
@@ -387,7 +437,8 @@ def stream_story_pipeline(
         yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: 旁白中"
 
         final_shot, msg = post_process_shot(
-            vid_path, narration, sec_per_shot, voice, bool(burn_subtitle),
+            vid_path, narration, actual_sec, voice, bool(burn_subtitle),
+            pre_audio=pre_aiff,
         )
         log_lines.append(f"[3/3] {msg}")
         completed.append(str(final_shot))
@@ -402,7 +453,7 @@ def stream_story_pipeline(
     log_lines.append(f"\n=== 串接 {len(completed)} 鏡頭 ===")
     yield "\n".join(log_lines[-40:]), completed, None, "串接中"
 
-    final_path, concat_msg = concat_shots(completed)
+    final_path, concat_msg = concat_shots(completed, bgm_file_in, bgm_volume_in)
     log_lines.append(f"=== {concat_msg}")
     progress(1.0, desc="完成")
     yield "\n".join(log_lines[-40:]), completed, final_path, f"完成: {concat_msg}"
@@ -529,12 +580,35 @@ def stream_generate(df: pd.DataFrame, aspect, fps, mode_label, seed, model,
     yield "\n".join(log_lines[-30:]), shots_done, None
 
 
-def concat_shots(shot_paths: list[str]):
-    """串接已生成的鏡頭。
+def _mix_background_music(video_in: Path, music_in: Path, volume_db: float,
+                           video_out: Path) -> bool:
+    """把 music_in 以 volume_db (dB) 混入 video_in 已有的音軌，輸出 video_out。"""
+    import math
+    vol_lin = 10 ** (volume_db / 20.0)
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(video_in),
+        "-stream_loop", "-1", "-i", str(music_in),
+        "-filter_complex",
+        f"[1:a]volume={vol_lin:.3f}[bg];"
+        f"[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+        "-map", "0:v:0", "-map", "[aout]",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        "-shortest",
+        str(video_out),
+    ]
+    subprocess.run(cmd, capture_output=True, text=True)
+    return video_out.exists() and video_out.stat().st_size > 0
 
-    Bug 修復：原本用 check=True，ffmpeg 在 concat demuxer + -c copy 模式下，
-    遇到輕微的 timebase / DTS 警告會回傳非零但仍產出有效檔案，造成 UI 誤報失敗。
-    改為「檔案存在且 > 0 byte」即視為成功；stream copy 真的失敗時降級為重編碼。
+
+def concat_shots(shot_paths: list[str], music_file=None, music_volume_db: float = -15.0):
+    """串接已生成的鏡頭，可選擇混入背景音樂。
+
+    music_file: gradio File 物件或路徑字串；None 表示不混音樂
+    music_volume_db: 背景音樂相對於原音的 dB（負值較安靜，預設 -15dB）
+
+    Bug 修復：ffmpeg concat + -c copy 警告會回非零但仍產出有效檔案，改為依
+    「檔案存在且 > 0 byte」判定。
     """
     if not shot_paths:
         return None, "尚無已生成的鏡頭"
@@ -549,21 +623,41 @@ def concat_shots(shot_paths: list[str]):
          "-c", "copy", str(final_path)],
         capture_output=True, text=True,
     )
-    if final_path.exists() and final_path.stat().st_size > 0:
-        suffix = "" if proc.returncode == 0 else f"（ffmpeg 警告 rc={proc.returncode}，檔案仍有效）"
-        return str(final_path), f"串接完成: {final_path.name}{suffix}"
+    concat_ok = final_path.exists() and final_path.stat().st_size > 0
 
-    proc2 = subprocess.run(
-        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-         "-f", "concat", "-safe", "0", "-i", str(list_file),
-         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
-         str(final_path)],
-        capture_output=True, text=True,
-    )
-    if final_path.exists() and final_path.stat().st_size > 0:
-        return str(final_path), f"串接完成（已重新編碼）: {final_path.name}"
-    err = (proc2.stderr or proc.stderr or "")[-400:]
-    return None, f"ffmpeg 失敗: {err}"
+    if not concat_ok:
+        # stream copy 失敗 → 重編碼
+        proc2 = subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+             "-f", "concat", "-safe", "0", "-i", str(list_file),
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+             str(final_path)],
+            capture_output=True, text=True,
+        )
+        concat_ok = final_path.exists() and final_path.stat().st_size > 0
+        if not concat_ok:
+            err = (proc2.stderr or proc.stderr or "")[-400:]
+            return None, f"ffmpeg 失敗: {err}"
+
+    # 解析音樂檔案路徑
+    music_path = None
+    if music_file is not None:
+        p = music_file.name if hasattr(music_file, "name") else str(music_file)
+        if p and Path(p).exists():
+            music_path = Path(p)
+
+    if music_path is None:
+        rc_note = "" if proc.returncode == 0 else f"（rc={proc.returncode}）"
+        return str(final_path), f"串接完成: {final_path.name}{rc_note}"
+
+    # 混入背景音樂
+    final_with_music = OUT_DIR / f"final-{timestamp}_bgm.mp4"
+    if _mix_background_music(final_path, music_path,
+                              float(music_volume_db), final_with_music):
+        return str(final_with_music), \
+            f"串接 + 配樂完成: {final_with_music.name}（音樂 {music_volume_db}dB）"
+    return str(final_path), \
+        f"串接完成但配樂混入失敗，回傳純串接版: {final_path.name}"
 
 
 def build_keyframe_cmd(prompt: str, start_img: str, end_img: str, seconds: float,
@@ -726,6 +820,23 @@ def add_row(df: pd.DataFrame, default_dur: float) -> pd.DataFrame:
     return pd.concat([df, new], ignore_index=True)
 
 
+def push_flux_to_storyboard(flux_paths: list[str], df: pd.DataFrame,
+                             default_dur: float) -> pd.DataFrame:
+    """把 Tab 3 生成的圖一鍵新增為 Tab 1 分鏡列。"""
+    if not flux_paths:
+        return df if df is not None else make_initial_df()
+    if df is None:
+        df = make_initial_df().iloc[0:0]
+    rows = [
+        [default_dur, "subtle cinematic zoom in, smooth camera", p, ""]
+        for p in flux_paths if Path(p).exists()
+    ]
+    if not rows:
+        return df
+    new_df = pd.DataFrame(rows, columns=df.columns)
+    return pd.concat([df, new_df], ignore_index=True)
+
+
 def delete_row(df: pd.DataFrame, selected: int | None) -> pd.DataFrame:
     if df is None or selected is None:
         return df
@@ -758,8 +869,19 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
             label="TTS 語音（zh_TW，旁白用）",
         )
         burn_subtitle = gr.Checkbox(
-            value=True, label="燒入字幕（中文 PingFang，旁白文字 → 字幕）",
+            value=True, label="燒入字幕（中文 PingFang）",
         )
+    with gr.Accordion("背景音樂（選填，會在最終 concat 後混入）", open=False):
+        with gr.Row():
+            bgm_file = gr.File(
+                label="背景音樂檔（mp3/wav/m4a）",
+                file_types=["audio"], file_count="single",
+                height=80, scale=2,
+            )
+            bgm_volume = gr.Slider(
+                -40, 0, value=-15, step=1, scale=1,
+                label="背景音樂音量（dB，越負越小聲；旁白約 0dB）",
+            )
 
     completed_state = gr.State([])
     flux_state = gr.State([])
@@ -1064,11 +1186,30 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
                 [flux_log_box, flux_state, flux_status],
             ).then(update_flux_gallery, flux_state, flux_gallery)
 
+            with gr.Row():
+                push_to_t1_btn = gr.Button(
+                    "把生成圖一鍵新增為「手動分鏡」列",
+                    variant="primary",
+                )
+                push_to_t2_btn = gr.Button(
+                    "把生成圖一鍵丟到「圖片轉場」",
+                )
+            push_to_t1_btn.click(
+                push_flux_to_storyboard,
+                [flux_state, storyboard, default_dur],
+                storyboard,
+            )
+            push_to_t2_btn.click(
+                lambda paths: [p for p in paths if Path(p).exists()],
+                flux_state, keyframe_files,
+            ).then(
+                preview_uploads, keyframe_files, keyframe_gallery,
+            )
+
             gr.Markdown(
                 "**接續工作流**：\n"
-                "1. 右鍵 gallery 圖片 → 「複製圖片網址」可得本地路徑\n"
-                "2. 切到「分鏡腳本」Tab → 上傳該檔案到「參考圖」區 → 套用到列\n"
-                "3. 或切到「關鍵幀串接」Tab → 直接把多張圖一起拖上去"
+                "1. 一鍵按鈕直接把生圖塞到 Tab 1 / 2，無需手動複製路徑\n"
+                "2. 或右鍵 gallery 圖片 → 「複製圖片網址」拿本地路徑手動貼"
             )
 
     # ========================== 共用區：預覽 + 串接 ==========================
@@ -1094,7 +1235,8 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
     story_run_btn.click(
         stream_story_pipeline,
         [story_text, story_style, story_custom_style, story_sec, story_motion,
-         aspect, fps, seed, model, enhance, voice, burn_subtitle, mode],
+         aspect, fps, seed, model, enhance, voice, burn_subtitle, mode,
+         bgm_file, bgm_volume],
         [story_log, completed_state, story_final_video, story_status],
     ).then(update_gallery_from_state, completed_state, shot_gallery)
 
@@ -1110,7 +1252,11 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
         [kf_log_box, completed_state, final_video],
     ).then(update_gallery_from_state, completed_state, shot_gallery)
 
-    concat_btn.click(concat_shots, completed_state, [final_video, concat_status])
+    concat_btn.click(
+        concat_shots,
+        [completed_state, bgm_file, bgm_volume],
+        [final_video, concat_status],
+    )
     clear_completed_btn.click(
         clear_completed, None,
         [completed_state, shot_gallery, final_video, concat_status],
