@@ -79,44 +79,66 @@ EXTRA_ARGS="..." 附加 ltx-2-mlx 旗標（如 --cfg-scale 4.0）
 # 自動開啟瀏覽器到 http://127.0.0.1:7860
 ```
 
-面板功能（Tabs 結構）：
+面板功能（Tabs 結構，從推薦到進階）：
 
 **全域設定**：aspect / fps / mode / seed / model / enhance / TTS 語音 / 燒入字幕
 
-**Tab 1「分鏡腳本（每鏡一圖 i2v）」**
+**Tab 0「故事一鍵生成（推薦）」** ★主要工作流★
+- 單一 textbox 寫故事（每行 = 一鏡）
+- 風格 dropdown（寫實電影 / 奇幻動畫 / 3D / 水墨 / 懸疑昏暗 / 新聞紀錄 / 自訂）
+- 一個按鈕跑完整 pipeline：FLUX 出圖 → LTX i2v 雙錨 → TTS + 字幕 → concat
+- 結果寫入共享 completed_state，可跨 tab 細調
+
+**Tab 1「手動分鏡（每鏡一圖 i2v）」**
 - 4 欄編輯式表格：秒 / Prompt / i2v 圖路徑 / 旁白文字
 - 新增 / 刪除 / 上下移動列
-- 參考圖：點選列 → 上傳圖 → 套用到該列；有圖時自動切 `--two-stage` + 頭尾雙錨
-- 旁白：每列可寫中文，生成完自動 TTS（macOS `say`）+ ffmpeg 燒中文字幕（PingFang）
+- 參考圖：點選列 → 上傳圖 → 套用；有圖時自動切 `--two-stage` + 頭尾雙錨
+- 旁白：每列可寫中文，自動 TTS + ffmpeg 燒字幕
 - Storyboard JSON 匯出 / 匯入
 
-**Tab 2「關鍵幀串接（多圖轉場）」**
+**Tab 2「圖片轉場（多圖 keyframe）」**
 - 多圖上傳 → N-1 段 `ltx-2-mlx keyframe`
 - 適合定格動畫、角色變化、場景轉場（起終雙鎖，身份保留比 i2v 強）
 
-**Tab 3「AI 靜圖生成（mflux）」**
-- 本地 FLUX.1 (schnell / dev)，4-bit 量化版
+**Tab 3「AI 靜圖（FLUX）」**
+- 本地 FLUX.1 (schnell / dev)，4-bit 量化
 - 多張同 prompt 不同 seed 探索構圖
-- 結果可直接複製路徑後丟到 Tab 1 / Tab 2
+- 結果可複製路徑後丟到 Tab 1 / Tab 2
 
 **共用區（Tabs 下方）**
-- 完成鏡頭 gallery（兩個生成 tab 共用同一個 completed_state）
+- 完成鏡頭 gallery（所有 tab 共用同一個 completed_state）
 - 一鍵 ffmpeg concat 串成最終影片
 - 「清空完成清單」避免混搭
 
-## 奇聞動畫式端到端流程範例
+## 奇聞動畫式端到端流程（推薦：Tab 0 一鍵）
 
 ```text
-1. Tab 3 (mflux) 寫 prompt → 生 3 張不同場景圖
-2. 切 Tab 1，新增 3 列鏡頭，每列：
-   - 秒 = 4，Prompt = 「拉近 / 漸進，雲在動」
-   - i2v 圖 = Tab 3 生出的對應圖
-   - 旁白 = 「故事第一段...」
-3. 全域勾「燒入字幕」+ 選 Meijia 語音
-4. 按「開始生成全部鏡頭」
-   → 每鏡 ~3 分鐘（two-stage + 雙錨）
-   → 完成後自動 TTS + 字幕燒入 → 影片變 *_av.mp4
-5. 共用區按「串接成最終影片」→ 一支完整旁白短片
+1. 切「故事一鍵生成」Tab（預設）
+2. 在「故事腳本」textbox 寫故事，每行一鏡，1-2 句最佳
+3. 選「視覺風格」（寫實電影 / 奇幻動畫 / 3D / 水墨 / 懸疑昏暗 / 新聞紀錄 / 自訂）
+4. 確認「每鏡秒數」（預設 4）與「動作 prompt」（預設緩慢推近）
+5. 全域確認 TTS 語音（預設 Meijia）+ 是否燒字幕（預設 開）
+6. 按「一鍵生成全部」
+
+內部流程（每鏡自動跑）:
+  [1/3] FLUX schnell 生圖（~30s/張，首跑下載 ~6GB）
+  [2/3] LTX --two-stage + 雙錨 i2v（~2-3 min/鏡）
+  [3/3] macOS say TTS + ffmpeg 燒中文字幕 + mux 音軌
+最終 ffmpeg concat 所有鏡頭為最終 mp4
+```
+
+> 中途想細調個別鏡頭？切到「手動分鏡」Tab，分鏡狀態已分享。
+
+## 進階：手動分鏡細調
+
+```text
+1. Tab 3 「AI 靜圖」寫 prompt → 生 3 張不同 seed 探索
+2. 切 Tab 1「手動分鏡」，新增 3 列鏡頭，每列：
+   - 秒 = 4，Prompt = 動作描述（如「拉近、雲在動」）
+   - i2v 圖 = Tab 3 生出的對應圖（右鍵複製路徑後上傳）
+   - 旁白 = 該鏡的中文旁白
+3. 按「開始生成全部鏡頭」→ 每鏡自動 TTS + 字幕
+4. 共用區「串接成最終影片」
 ```
 
 ## 解析度對照

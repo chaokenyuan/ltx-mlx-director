@@ -238,6 +238,176 @@ def stream_flux(prompt: str, model_key: str, count: int, aspect: str,
     yield "\n".join(log_lines[-30:]), produced, f"完成：{len(produced)} 張"
 
 
+# ============================================================
+# 故事一鍵生成 pipeline 用的 subprocess 串流 helper
+# ============================================================
+
+STREAM_LOG_KEYWORDS = (
+    "Denoising", "Loading", "Decoding", "Saved", "Time:", "Fetching",
+    "Generating", "Error", "Traceback", "step", "Step",
+)
+
+
+def _stream_subprocess(cmd: list[str], log_lines: list[str], cwd: str | None = None):
+    """以 generator 形式跑 subprocess，每出現關鍵 log 行就 yield 當前 log；
+    最後 yield 一個 int (returncode)。
+    """
+    p = subprocess.Popen(
+        cmd, cwd=cwd,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    assert p.stdout is not None
+    for raw in p.stdout:
+        for line in raw.replace("\r", "\n").split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            if any(k in line for k in STREAM_LOG_KEYWORDS):
+                log_lines.append(f"     {line[-180:]}")
+                yield "\n".join(log_lines[-40:])
+    p.wait()
+    yield p.returncode
+
+
+# ============================================================
+# 端到端：故事 → FLUX 靜圖 → LTX i2v → TTS+字幕 → concat
+# ============================================================
+
+STYLE_PRESETS = {
+    "寫實電影風": ("cinematic, photorealistic, dramatic lighting, "
+                "professional cinematography, shallow depth of field"),
+    "奇幻動畫風": ("anime style, vibrant colors, soft cel shading, "
+                "fantasy aesthetic, studio ghibli inspired"),
+    "3D 渲染風": ("3D rendered, octane render, hyperrealistic, "
+                "depth of field, volumetric lighting"),
+    "水墨風": ("traditional Chinese ink painting, brush strokes, "
+             "monochrome with subtle color accents, paper texture"),
+    "懸疑昏暗風": ("dark moody atmosphere, dim lighting, mystery, "
+                "fog, low key cinematography, film noir"),
+    "新聞紀錄風": ("documentary style, natural lighting, gritty realism, "
+                "candid composition, journalistic"),
+    "自訂": "",
+}
+
+
+def stream_story_pipeline(
+    story_text: str, style_preset: str, custom_style: str,
+    sec_per_shot: float, motion_prompt: str,
+    aspect: str, fps, seed, model: str, enhance: bool,
+    voice: str, burn_subtitle: bool, mode_label: str,
+    progress=gr.Progress(),
+):
+    """每行 = 一鏡頭。對每行：FLUX 出圖 → LTX i2v 雙錨 → TTS+字幕 → concat。"""
+    if not story_text or not story_text.strip():
+        yield "請先寫故事腳本（每行一鏡頭）", [], None, "未開始"
+        return
+
+    lines = [l.strip() for l in story_text.split("\n") if l.strip()]
+    if not lines:
+        yield "故事為空", [], None, "未開始"
+        return
+
+    if style_preset == "自訂":
+        style_prompt = custom_style.strip() or "cinematic"
+    else:
+        style_prompt = STYLE_PRESETS.get(style_preset, "cinematic")
+        if custom_style.strip():
+            style_prompt = f"{style_prompt}, {custom_style.strip()}"
+
+    motion = motion_prompt.strip() or "subtle cinematic camera movement"
+    base_seed = (int(datetime.now().timestamp()) % (10 ** 8)
+                  if int(seed) == -1 else int(seed))
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = f"story-{timestamp}"
+    completed: list[str] = []
+    log_lines: list[str] = [
+        f"故事 {len(lines)} 鏡頭 | 風格: {style_preset} | "
+        f"每鏡 {sec_per_shot}s | aspect {aspect} | voice {voice}",
+        "",
+    ]
+    total = len(lines)
+
+    for i, narration in enumerate(lines):
+        shot_idx = i + 1
+        progress((i) / total, desc=f"Shot {shot_idx}/{total}")
+        log_lines.append(f"=== Shot {shot_idx}/{total} ===")
+        log_lines.append(f"旁白: {narration[:80]}{'...' if len(narration) > 80 else ''}")
+        yield "\n".join(log_lines[-40:]), completed, None, f"處理 Shot {shot_idx}/{total}"
+
+        # --- 1/3: FLUX 靜圖 ---
+        img_path = OUT_DIR / f"{base}_{shot_idx:02d}.png"
+        img_prompt = f"{style_prompt}. {narration}"
+        log_lines.append(f"[1/3] FLUX: {img_prompt[:120]}")
+        yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: 生圖中"
+
+        flux_cmd = build_flux_cmd(
+            img_prompt, list(FLUX_MODELS)[0], aspect,
+            base_seed + i * 17, img_path,
+        )
+        rc_flux = None
+        for item in _stream_subprocess(flux_cmd, log_lines):
+            if isinstance(item, int):
+                rc_flux = item
+            else:
+                yield item, completed, None, f"Shot {shot_idx}: 生圖中"
+
+        if not (img_path.exists() and img_path.stat().st_size > 0):
+            log_lines.append(f"[1/3] FLUX 失敗 rc={rc_flux}，跳過此鏡")
+            yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: 失敗"
+            continue
+        log_lines.append(f"[1/3] FLUX 完成: {img_path.name}")
+
+        # --- 2/3: LTX i2v 雙錨 ---
+        vid_path = OUT_DIR / f"{base}_{shot_idx:02d}.mp4"
+        log_lines.append(f"[2/3] LTX i2v: {motion}")
+        yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: 動畫中"
+
+        ltx_cmd, _i2v_lock = build_cmd(
+            motion, sec_per_shot, str(img_path),
+            aspect, int(fps), mode_label,
+            base_seed + i * 17, model, enhance, vid_path,
+        )
+        rc_ltx = None
+        for item in _stream_subprocess(ltx_cmd, log_lines, cwd=str(REPO_DIR)):
+            if isinstance(item, int):
+                rc_ltx = item
+            else:
+                yield item, completed, None, f"Shot {shot_idx}: 動畫中"
+
+        if not (vid_path.exists() and vid_path.stat().st_size > 0):
+            log_lines.append(f"[2/3] LTX 失敗 rc={rc_ltx}，跳過此鏡")
+            yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: 失敗"
+            continue
+        log_lines.append(f"[2/3] LTX 完成: {vid_path.name}")
+
+        # --- 3/3: TTS + 字幕 ---
+        log_lines.append(f"[3/3] TTS + 字幕（{voice}）")
+        yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: 旁白中"
+
+        final_shot, msg = post_process_shot(
+            vid_path, narration, sec_per_shot, voice, bool(burn_subtitle),
+        )
+        log_lines.append(f"[3/3] {msg}")
+        completed.append(str(final_shot))
+        yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: 完成"
+
+    # --- 最終 concat ---
+    if not completed:
+        log_lines.append("\n沒有成功的鏡頭，無法串接")
+        yield "\n".join(log_lines[-40:]), completed, None, "全部失敗"
+        return
+
+    log_lines.append(f"\n=== 串接 {len(completed)} 鏡頭 ===")
+    yield "\n".join(log_lines[-40:]), completed, None, "串接中"
+
+    final_path, concat_msg = concat_shots(completed)
+    log_lines.append(f"=== {concat_msg}")
+    progress(1.0, desc="完成")
+    yield "\n".join(log_lines[-40:]), completed, final_path, f"完成: {concat_msg}"
+
+
 def build_cmd(prompt: str, seconds: float, image: str, aspect: str, fps: int,
               mode_label: str, seed: int, model: str, enhance: bool,
               out_path: Path) -> tuple[list[str], bool]:
@@ -595,8 +765,70 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
     flux_state = gr.State([])
 
     with gr.Tabs():
+        # ============================ Tab 0: 故事一鍵生成（推薦）==============================
+        with gr.Tab("故事一鍵生成（推薦）"):
+            gr.Markdown(
+                "**最短路徑**：寫故事 → 自動切分鏡 → 自動 FLUX 出圖 → 自動 LTX 動畫 → "
+                "自動 TTS 旁白 + 字幕 → 自動 concat。一鍵到最終影片。\n\n"
+                "**每一行 = 一鏡頭**。建議每行 1-2 句，描述「畫面 + 動作」或「旁白」。"
+                "每鏡都會用該行作為圖片 prompt（接上風格詞）也作為旁白文字。"
+            )
+
+            story_text = gr.Textbox(
+                label="故事腳本（每行一鏡）",
+                value=(
+                    "在台灣東部的某個小漁村，住著一位八十歲的老漁夫。\n"
+                    "每天清晨，他會踏上熟悉的礁石小路，等待海鳥啟程的瞬間。\n"
+                    "據說那一刻，整片海洋會跟著呼吸。"
+                ),
+                lines=8,
+                placeholder="一行寫一個鏡頭，會自動拆分...",
+            )
+
+            with gr.Row():
+                story_style = gr.Dropdown(
+                    list(STYLE_PRESETS), value="寫實電影風",
+                    label="視覺風格（套到所有鏡頭圖 prompt）",
+                )
+                story_custom_style = gr.Textbox(
+                    label="風格 prompt 補強（會接在風格之後，英文較好）",
+                    placeholder="golden hour, fog, low angle",
+                    lines=2,
+                )
+
+            with gr.Row():
+                story_sec = gr.Number(
+                    value=4, label="每鏡秒數", precision=1,
+                    minimum=2, maximum=10,
+                )
+                story_motion = gr.Textbox(
+                    label="動作 prompt（套到所有鏡頭的 LTX，描述鏡頭運動）",
+                    value="subtle cinematic zoom in, smooth camera, atmospheric",
+                    lines=2,
+                )
+
+            story_run_btn = gr.Button(
+                "一鍵生成全部（圖 → 動畫 → 旁白 → 字幕 → 串接）",
+                variant="primary", size="lg",
+            )
+            story_status = gr.Markdown("尚未開始")
+            story_log = gr.Textbox(
+                label="進度", lines=14, max_lines=24,
+                autoscroll=True, elem_id="log_box",
+            )
+            story_final_video = gr.Video(label="最終影片（自動串接）", height=420)
+
+            gr.Markdown(
+                "**內部流程（每鏡）**\n"
+                "1. FLUX schnell 生圖（約 30 秒/張，首跑下載 ~6GB）\n"
+                "2. LTX `--two-stage` 頭尾雙錨 i2v（約 2-3 分/鏡）\n"
+                "3. macOS `say` 出 TTS aiff + ffmpeg 燒中文字幕 + mux 音軌\n"
+                "4. 全部完成後 ffmpeg concat 為最終 mp4\n\n"
+                "想細調個別鏡頭：切到 **手動分鏡** Tab，分鏡內容已分享到那邊。"
+            )
+
         # ============================== Tab 1: 分鏡腳本 ==============================
-        with gr.Tab("分鏡腳本（每鏡一圖 i2v）"):
+        with gr.Tab("手動分鏡（每鏡一圖 i2v）"):
             gr.Markdown(
                 "點選列以選取，再用按鈕移動或刪除。可以直接編輯儲存格。\n"
                 "**參考圖**：點選任一列 → 上傳圖 → 「套用到選取列」。"
@@ -721,8 +953,8 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
                 import_btn = gr.Button("從下方 JSON 匯入")
             json_box = gr.Code(label="Storyboard JSON", language="json", lines=10)
 
-        # ============================ Tab 2: 關鍵幀串接 ==============================
-        with gr.Tab("關鍵幀串接（多圖轉場）"):
+        # ============================ Tab 2: 圖片轉場 ==============================
+        with gr.Tab("圖片轉場（多圖 keyframe）"):
             gr.Markdown(
                 "上傳 N 張圖（依想要的順序），系統會用 `ltx-2-mlx keyframe` "
                 "在每兩張之間補出一段轉場影片。共產出 **N-1 段**，"
@@ -778,8 +1010,8 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
                 "- 解析度自動依「畫面比例」套用，圖會被中央裁切到目標尺寸"
             )
 
-        # ============================ Tab 3: AI 靜圖生成 ==============================
-        with gr.Tab("AI 靜圖生成（mflux）"):
+        # ============================ Tab 3: AI 靜圖 ==============================
+        with gr.Tab("AI 靜圖（FLUX）"):
             gr.Markdown(
                 "用本地 **FLUX.1**（透過 `mflux`）生成分鏡靜圖，無需 Midjourney "
                 "訂閱。圖會存到 `~/ltx-2-mlx/output/`，可直接拖到 Tab 1 i2v 區或 "
@@ -858,7 +1090,14 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
     def clear_completed():
         return [], [], None, "已清空完成清單"
 
-    # 兩個 generate 入口都更新 completed_state，並都會觸發 gallery 重繪
+    # 三個 generate 入口都更新 completed_state，並都會觸發 gallery 重繪
+    story_run_btn.click(
+        stream_story_pipeline,
+        [story_text, story_style, story_custom_style, story_sec, story_motion,
+         aspect, fps, seed, model, enhance, voice, burn_subtitle, mode],
+        [story_log, completed_state, story_final_video, story_status],
+    ).then(update_gallery_from_state, completed_state, shot_gallery)
+
     gen_btn.click(
         stream_generate,
         [storyboard, aspect, fps, mode, seed, model, enhance, voice, burn_subtitle],
