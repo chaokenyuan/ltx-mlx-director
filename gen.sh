@@ -105,20 +105,39 @@ mode_flag() {
 }
 
 # ---------- 單鏡執行 ----------
+#
+# 參考圖識別保留：當提供 -i / --image 時，覆寫 pipeline 為 --one-stage（含 CFG，
+# q4 可用），並加上頭尾雙錨 --image PATH 0 1.0 + --image PATH (frames-1) 1.0。
+# 因為 --distilled 模式 no CFG，圖只鎖第 0 幀，之後立即朝 prompt 飄走。
 run_shot() {
   local prompt="$1" out_path="$2" sec="$3"
-  local frames width height pipe
+  local frames width height pipe i2v_lock=0
   read -r width height < <(aspect_to_wh "$ASPECT")
   frames=$(duration_to_frames "$sec" "$FPS")
-  pipe=$(mode_flag "$MODE")
 
   local image_args=()
-  [ -n "$IMAGE" ] && image_args=(--image "$IMAGE")
+  if [ -n "$IMAGE" ]; then
+    if [ ! -f "$IMAGE" ]; then
+      echo "找不到參考圖: $IMAGE" >&2
+      exit 1
+    fi
+    i2v_lock=1
+    pipe="--one-stage"
+    image_args=(--image "$IMAGE" 0 1.0 --image "$IMAGE" "$((frames - 1))" 1.0)
+  else
+    pipe=$(mode_flag "$MODE")
+  fi
+
   local enhance_args=()
   [ "$ENHANCE" -eq 1 ] && enhance_args=(--enhance-prompt)
 
-  echo "  ── shot: \"$prompt\""
-  echo "     size=${width}x${height}  frames=${frames}  fps=${FPS}  seed=${SEED}  mode=${MODE}"
+  echo "  shot: \"$prompt\""
+  if [ "$i2v_lock" -eq 1 ]; then
+    echo "     size=${width}x${height}  frames=${frames}  fps=${FPS}  seed=${SEED}  mode=one-stage（i2v 鎖定，覆寫 ${MODE}）"
+    echo "     image=${IMAGE}  雙端錨點 (0 + $((frames - 1)))"
+  else
+    echo "     size=${width}x${height}  frames=${frames}  fps=${FPS}  seed=${SEED}  mode=${MODE}"
+  fi
 
   cd "$REPO_DIR"
   # shellcheck disable=SC2086

@@ -107,6 +107,20 @@ EXTRA_ARGS="..." 附加 ltx-2-mlx 旗標（如 --cfg-scale 4.0）
 - 首次跑 `--distilled` 或 `--two-stages-hq` 會下載對應權重，分別約 12GB / 25GB+。
 - 「秒數」會對齊到 `1 + 8N` 幀，實際長度可能略長於設定。
 
+### 參考圖（i2v）保留策略
+
+LTX-2.3 上游已知行為：所有 `generate` pipeline 中 `--image` 只作為「第 0 幀的初始化」，
+之後 4 秒內影片會朝 prompt 描述的分佈飄走（即使設定 STG=1.0 也一樣）。
+
+本工具的補救：當任一鏡頭含參考圖時，自動：
+
+1. **覆寫 pipeline 為 `--one-stage`**（CFG + 全解析度，q4 可用）— 因為 `--distilled` 無 CFG，圖像條件最弱。
+2. **頭尾雙端錨點**：`--image PATH 0 1.0 --image PATH (frames-1) 1.0`，鎖住首尾兩幀為同一張圖。
+
+代價：速度慢 3-5 倍（`--distilled` 約 1 分鐘 → `--one-stage` 約 3-5 分鐘）。
+若需要極致的身份保留（畫面每一幀都被參考圖控制），需改用 `ic-lora` + canny edge —
+此模式較重，尚未整合進 UI / CLI，計畫後續加入。
+
 ## 授權
 
 MIT。底層引擎 `ltx-2-mlx` 與 LTX-2 模型權重各有授權，請依其條款使用。

@@ -55,10 +55,24 @@ def make_initial_df() -> pd.DataFrame:
 
 def build_cmd(prompt: str, seconds: float, image: str, aspect: str, fps: int,
               mode_label: str, seed: int, model: str, enhance: bool,
-              out_path: Path) -> list[str]:
+              out_path: Path) -> tuple[list[str], bool]:
+    """構建 ltx-2-mlx generate 命令。
+
+    回傳 (cmd, used_i2v_lock)，後者用於 UI 顯示「i2v 強鎖定」狀態。
+
+    參考圖識別保留策略：
+    當提供 --image 時，原本 --distilled 模式因為 no CFG，圖只在第 0 幀短暫出現後
+    立刻飄走（LTX-2.3 上游已知特性）。改用 --one-stage（含 CFG，q4 模型支援），
+    並加上頭尾雙錨：--image PATH 0 1.0 + --image PATH (frames-1) 1.0，
+    可大幅提升整支影片對參考圖的忠實度。
+    """
     w, h = ASPECT_WH[aspect]
     frames = duration_to_frames(seconds, fps)
-    pipe = MODE_FLAGS[mode_label]
+
+    has_image = bool(image and image.strip()
+                     and Path(image).expanduser().exists())
+    pipe = "--one-stage" if has_image else MODE_FLAGS[mode_label]
+
     cmd = [
         str(LTX_BIN), "generate",
         "-p", prompt,
@@ -70,11 +84,14 @@ def build_cmd(prompt: str, seconds: float, image: str, aspect: str, fps: int,
         "--model", model,
         "-o", str(out_path),
     ]
-    if image and image.strip() and Path(image).expanduser().exists():
-        cmd += ["--image", str(Path(image).expanduser())]
+    if has_image:
+        img_path = str(Path(image).expanduser())
+        # 雙端錨點：第 0 幀 + 最後 1 幀皆鎖在同一張參考圖
+        cmd += ["--image", img_path, "0", "1.0"]
+        cmd += ["--image", img_path, str(frames - 1), "1.0"]
     if enhance:
         cmd += ["--enhance-prompt"]
-    return cmd
+    return cmd, has_image
 
 
 def stream_generate(df: pd.DataFrame, aspect, fps, mode_label, seed, model,
@@ -105,12 +122,15 @@ def stream_generate(df: pd.DataFrame, aspect, fps, mode_label, seed, model,
             continue
 
         out_path = OUT_DIR / f"{base}_{int(i)+1:02d}.mp4"
-        cmd = build_cmd(prompt, seconds, image, aspect, int(fps),
-                        mode_label, int(seed), model, enhance, out_path)
+        cmd, i2v_lock = build_cmd(prompt, seconds, image, aspect, int(fps),
+                                   mode_label, int(seed), model, enhance, out_path)
 
         progress((i) / total, desc=f"Shot {i+1}/{total}: {prompt[:30]}")
-        log_lines.append(f"\n=== Shot {i+1}/{total} | {seconds}s | {aspect} ===")
+        lock_tag = " | i2v鎖定(one-stage+雙端錨)" if i2v_lock else ""
+        log_lines.append(f"\n=== Shot {i+1}/{total} | {seconds}s | {aspect}{lock_tag} ===")
         log_lines.append(f"Prompt: {prompt}")
+        if i2v_lock:
+            log_lines.append(f"Image: {image}")
         yield "\n".join(log_lines[-30:]), shots_done, None
 
         p = subprocess.Popen(
