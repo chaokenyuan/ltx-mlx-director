@@ -122,7 +122,9 @@ run_shot() {
       exit 1
     fi
     i2v_lock=1
-    pipe="--one-stage"
+    # 注意：--one-stage 只支援單張單錨；多錨點 i2v 需要 --two-stage 或 --two-stages-hq
+    # help 寫 --two-stage requires q8，實測 q4 可用
+    pipe="--two-stage"
     image_args=(--image "$IMAGE" 0 1.0 --image "$IMAGE" "$((frames - 1))" 1.0)
   else
     pipe=$(mode_flag "$MODE")

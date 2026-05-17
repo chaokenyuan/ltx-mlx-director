@@ -71,7 +71,9 @@ def build_cmd(prompt: str, seconds: float, image: str, aspect: str, fps: int,
 
     has_image = bool(image and image.strip()
                      and Path(image).expanduser().exists())
-    pipe = "--one-stage" if has_image else MODE_FLAGS[mode_label]
+    # 注意：--one-stage 不支援多錨點 i2v（只能單張單錨），所以有圖時改用 --two-stage
+    # 雖然 help 寫 --two-stage 「requires q8」，實測 q4 也可正常執行。
+    pipe = "--two-stage" if has_image else MODE_FLAGS[mode_label]
 
     cmd = [
         str(LTX_BIN), "generate",
