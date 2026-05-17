@@ -13,8 +13,8 @@ LTX-2.3 影片產生的「導演級」CLI 與 GUI，在 Apple Silicon Mac 本地
 |------|------|
 | OS | macOS + Apple Silicon (M1 以上) |
 | RAM | 16GB+（搭配 q4 + `--low-ram`），建議 32GB+ |
-| 磁碟 | 12GB（fast 模式）/ 30GB+（hq + two-stage）/ 60GB+（全模式皆下載一次） |
-| 工具 | `ffmpeg`、`uv`、Python 3.11+ |
+| 磁碟 | 12GB（fast）/ 60GB+（含 two-stage 與 hq）/ 再 +6GB（FLUX.1 schnell q4）/ +12GB（FLUX.1 dev q4） |
+| 工具 | `ffmpeg`、`uv`、Python 3.11+、macOS `say` 與 PingFang 字型（系統內建） |
 
 ## 安裝
 
@@ -79,14 +79,45 @@ EXTRA_ARGS="..." 附加 ltx-2-mlx 旗標（如 --cfg-scale 4.0）
 # 自動開啟瀏覽器到 http://127.0.0.1:7860
 ```
 
-面板功能：
+面板功能（Tabs 結構）：
 
-- 全域設定（aspect / fps / mode / seed / model / enhance）
-- 編輯式分鏡表（新增 / 刪除 / 上下移動）
-- 逐鏡進度條與 log 串流
-- 完成鏡頭預覽（gallery）
-- 一鍵 ffmpeg concat 出最終影片
+**全域設定**：aspect / fps / mode / seed / model / enhance / TTS 語音 / 燒入字幕
+
+**Tab 1「分鏡腳本（每鏡一圖 i2v）」**
+- 4 欄編輯式表格：秒 / Prompt / i2v 圖路徑 / 旁白文字
+- 新增 / 刪除 / 上下移動列
+- 參考圖：點選列 → 上傳圖 → 套用到該列；有圖時自動切 `--two-stage` + 頭尾雙錨
+- 旁白：每列可寫中文，生成完自動 TTS（macOS `say`）+ ffmpeg 燒中文字幕（PingFang）
 - Storyboard JSON 匯出 / 匯入
+
+**Tab 2「關鍵幀串接（多圖轉場）」**
+- 多圖上傳 → N-1 段 `ltx-2-mlx keyframe`
+- 適合定格動畫、角色變化、場景轉場（起終雙鎖，身份保留比 i2v 強）
+
+**Tab 3「AI 靜圖生成（mflux）」**
+- 本地 FLUX.1 (schnell / dev)，4-bit 量化版
+- 多張同 prompt 不同 seed 探索構圖
+- 結果可直接複製路徑後丟到 Tab 1 / Tab 2
+
+**共用區（Tabs 下方）**
+- 完成鏡頭 gallery（兩個生成 tab 共用同一個 completed_state）
+- 一鍵 ffmpeg concat 串成最終影片
+- 「清空完成清單」避免混搭
+
+## 奇聞動畫式端到端流程範例
+
+```text
+1. Tab 3 (mflux) 寫 prompt → 生 3 張不同場景圖
+2. 切 Tab 1，新增 3 列鏡頭，每列：
+   - 秒 = 4，Prompt = 「拉近 / 漸進，雲在動」
+   - i2v 圖 = Tab 3 生出的對應圖
+   - 旁白 = 「故事第一段...」
+3. 全域勾「燒入字幕」+ 選 Meijia 語音
+4. 按「開始生成全部鏡頭」
+   → 每鏡 ~3 分鐘（two-stage + 雙錨）
+   → 完成後自動 TTS + 字幕燒入 → 影片變 *_av.mp4
+5. 共用區按「串接成最終影片」→ 一支完整旁白短片
+```
 
 ## 解析度對照
 
