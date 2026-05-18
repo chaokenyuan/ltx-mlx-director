@@ -424,6 +424,51 @@ SPLIT_MODE_LABELS = {
 }
 
 
+def list_v3ctor_articles(limit: int = 50) -> list[dict]:
+    """從 v3ctor.net/sitemap.xml 取最新文章清單。
+
+    回傳 [{title, url, date, slug}]，依 lastmod 倒序。
+    """
+    from urllib.request import Request, urlopen
+    from urllib.parse import unquote
+
+    req = Request(
+        "https://v3ctor.net/sitemap.xml",
+        headers={"User-Agent": "Mozilla/5.0 ltx-mlx-director/scraper"},
+    )
+    try:
+        with urlopen(req, timeout=15) as r:
+            xml = r.read().decode("utf-8", errors="replace")
+    except Exception:
+        return []
+
+    entries = re.findall(
+        r"<url>\s*<loc>([^<]+)</loc>\s*<lastmod>([^<]+)</lastmod>\s*</url>",
+        xml,
+    )
+    result: list[dict] = []
+    for url, date in entries:
+        if "/stories/" not in url:
+            continue
+        slug = unquote(url.rstrip("/").rsplit("/", 1)[-1])
+        if not re.match(r"^s\d+-", slug):
+            continue  # 跳過分類索引頁
+        # 抽中文標題（slug 中第一段中文）
+        m = re.search(r"[一-鿿].*$", slug)
+        title = m.group(0) if m else slug
+        result.append({
+            "title": title, "url": url,
+            "date": date[:10], "slug": slug,
+        })
+    result.sort(key=lambda x: x["date"], reverse=True)
+    return result[:limit]
+
+
+def _format_article_label(a: dict) -> str:
+    """dropdown 用：'2026-05-12 · 標題'"""
+    return f"{a['date']} · {a['title'][:50]}"
+
+
 # ============================================================
 # 故事一鍵生成 pipeline 用的 subprocess 串流 helper
 # ============================================================
@@ -1198,37 +1243,73 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
         # ============================ Tab 0: 故事一鍵生成（推薦）==============================
         with gr.Tab("故事一鍵生成（推薦）"):
             gr.Markdown(
-                "**最短路徑**：寫故事 → 自動切分鏡 → 自動 FLUX 出圖 → 自動 LTX 動畫 → "
-                "自動 TTS 旁白 + 字幕 → 自動 concat。一鍵到最終影片。\n\n"
-                "**每一行 = 一鏡頭**。建議每行 1-2 句，描述「畫面 + 動作」或「旁白」。"
-                "每鏡都會用該行作為圖片 prompt（接上風格詞）也作為旁白文字。"
+                "**預設工作流**：從 v3ctor.net 選一篇 → 按「🚀 抓 + 一鍵生成」"
+                "→ 自動拆鏡 / 動畫 / 旁白 / 字幕 / 串接，產出最終影片。\n\n"
+                "想自寫劇本？跳過下方 v3ctor 區，直接在「故事腳本」textbox 編輯，"
+                "按「一鍵生成全部」即可（每行 = 一鏡）。"
             )
 
-            with gr.Accordion("從 v3ctor.net 抓素材（選填）", open=False):
-                gr.Markdown(
-                    "貼一篇 https://v3ctor.net/stories/... 的 URL，"
-                    "自動抓標題與內文，按選定策略拆鏡頭填入下方故事腳本。"
+            # --- v3ctor.net 文章選取（預設工作流入口）---
+            gr.Markdown("### 從 v3ctor.net 選文章")
+            _initial_articles = list_v3ctor_articles(50)
+            _initial_choices = [
+                (_format_article_label(a), a["url"]) for a in _initial_articles
+            ]
+            _initial_url = _initial_articles[0]["url"] if _initial_articles else ""
+
+            with gr.Row():
+                v3_article_dd = gr.Dropdown(
+                    choices=_initial_choices,
+                    value=_initial_url or None,
+                    label=f"最新文章（共 {len(_initial_articles)} 篇，依 lastmod 排序）",
+                    scale=4, interactive=True,
                 )
-                with gr.Row():
-                    v3_url = gr.Textbox(
-                        label="文章 URL",
-                        placeholder="https://v3ctor.net/stories/動物/s086-alex-parrot-.../",
-                        scale=4,
-                    )
-                with gr.Row():
-                    v3_split_mode = gr.Dropdown(
-                        list(SPLIT_MODE_LABELS), value=list(SPLIT_MODE_LABELS)[0],
-                        label="拆鏡策略", scale=2,
-                    )
-                    v3_target_chars = gr.Slider(
-                        15, 80, value=35, step=5,
-                        label="目標字數／鏡（智能模式才生效）", scale=2,
-                    )
-                with gr.Row():
-                    v3_fetch_btn = gr.Button(
-                        "抓取並填入下方故事腳本", variant="primary",
-                    )
-                v3_info = gr.Markdown("")
+                v3_refresh_btn = gr.Button("重新載入清單", scale=1)
+            with gr.Row():
+                v3_url = gr.Textbox(
+                    value=_initial_url,
+                    label="URL（可手動改成任何 v3ctor.net/stories/... 的網址）",
+                    scale=4,
+                )
+            with gr.Row():
+                v3_split_mode = gr.Dropdown(
+                    list(SPLIT_MODE_LABELS), value=list(SPLIT_MODE_LABELS)[0],
+                    label="拆鏡策略", scale=2,
+                )
+                v3_target_chars = gr.Slider(
+                    15, 80, value=35, step=5,
+                    label="目標字數／鏡（智能模式才生效）", scale=2,
+                )
+            with gr.Row():
+                v3_fetch_btn = gr.Button(
+                    "抓取（填入下方故事腳本，不生成）", scale=1,
+                )
+                v3_run_btn = gr.Button(
+                    "🚀 抓 + 一鍵生成（最少操作）",
+                    variant="primary", scale=2, size="lg",
+                )
+            v3_info = gr.Markdown("")
+
+            # dropdown 變更 → 同步 URL textbox
+            v3_article_dd.change(
+                lambda url: url or "", v3_article_dd, v3_url,
+            )
+
+            # 重新載入清單
+            def _reload_articles():
+                arts = list_v3ctor_articles(50)
+                choices = [(_format_article_label(a), a["url"]) for a in arts]
+                first = arts[0]["url"] if arts else None
+                return (
+                    gr.update(choices=choices, value=first),
+                    first or "",
+                    f"已重新載入：{len(arts)} 篇",
+                )
+            v3_refresh_btn.click(
+                _reload_articles, None, [v3_article_dd, v3_url, v3_info],
+            )
+
+            gr.Markdown("### 故事腳本（每行 = 一鏡，可自寫或讓上方抓取自動填）")
 
             story_text = gr.Textbox(
                 label="故事腳本（每行一鏡）",
@@ -1608,6 +1689,19 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
 
     # 三個 generate 入口都更新 completed_state，並都會觸發 gallery 重繪
     story_run_btn.click(
+        stream_story_pipeline,
+        [story_text, story_style, story_custom_style, story_sec, story_motion,
+         aspect, fps, seed, model, enhance, voice, burn_subtitle, mode,
+         bgm_file, bgm_volume, i2v_mode_select, skip_image_gen],
+        [story_log, completed_state, story_final_video, story_status],
+    ).then(update_gallery_from_state, completed_state, shot_gallery)
+
+    # v3ctor: 抓取 + 一鍵生成（先 scrape 寫入 story_text，再跑 pipeline）
+    v3_run_btn.click(
+        _fetch_v3ctor_and_fill,
+        [v3_url, v3_split_mode, v3_target_chars],
+        [story_text, v3_info],
+    ).then(
         stream_story_pipeline,
         [story_text, story_style, story_custom_style, story_sec, story_motion,
          aspect, fps, seed, model, enhance, voice, burn_subtitle, mode,
