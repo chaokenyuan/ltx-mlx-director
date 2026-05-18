@@ -1498,4 +1498,8 @@ if __name__ == "__main__":
     app.queue().launch(
         server_name="127.0.0.1", server_port=7860, inbrowser=True,
         theme=gr.themes.Soft(), css=CSS,
+        # OUT_DIR 在 ~/ltx-2-mlx/output/，不在 cwd 內。
+        # 不加 allowed_paths 的話 Gradio 會拒絕 serve mp4/png/aiff 給瀏覽器，
+        # 結果就是「檔案有產出但 UI 顯示載入錯誤」。
+        allowed_paths=[str(OUT_DIR)],
     )
