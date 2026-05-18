@@ -1209,14 +1209,14 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
                     label="i2v 識別保留模式（有參考圖時生效）",
                 )
             with gr.Column(scale=1):
-            _lora_ok, _lora_gb = is_lora_cached(IC_LORA_UNION_CONTROL)
-            _lora_status_text = (
-                f"IC-LoRA Union Control: 已下載 ({_lora_gb:.1f} GB)"
-                if _lora_ok
-                else "IC-LoRA Union Control: 首跑會下載"
-            )
-            lora_status = gr.Markdown(_lora_status_text)
-            lora_recheck_btn = gr.Button("重新檢查 LoRA 狀態", size="sm")
+                _lora_ok, _lora_gb = is_lora_cached(IC_LORA_UNION_CONTROL)
+                _lora_status_text = (
+                    f"IC-LoRA Union Control: 已下載 ({_lora_gb:.1f} GB)"
+                    if _lora_ok
+                    else "IC-LoRA Union Control: 首跑會下載"
+                )
+                lora_status = gr.Markdown(_lora_status_text)
+                lora_recheck_btn = gr.Button("重新檢查 LoRA 狀態", size="sm")
 
     def _refresh_lora_status():
         ok, gb = is_lora_cached(IC_LORA_UNION_CONTROL)
