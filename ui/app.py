@@ -1208,15 +1208,25 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
         )
 
         def _preview_voice(voice_name):
+            """產出 WAV（瀏覽器原生支援；AIFF 不行）給 Gradio Audio 播。"""
             if not voice_name:
                 return None
             preview_dir = OUT_DIR / "_voice_preview"
             preview_dir.mkdir(exist_ok=True)
-            out_aiff = preview_dir / f"{voice_name}.aiff"
+            out_wav = preview_dir / f"{voice_name}.wav"
             sample = "你好，這是這個聲音的試聽範例。" \
                      "可以聽聽語速、音調和咬字是否合你的偏好。"
-            if tts_to_aiff(sample, voice_name, out_aiff):
-                return str(out_aiff)
+            try:
+                subprocess.run(
+                    ["say", "-v", voice_name,
+                     "--data-format=LEI16@22050",
+                     "-o", str(out_wav), sample],
+                    check=True, capture_output=True, text=True, timeout=30,
+                )
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                return None
+            if out_wav.exists() and out_wav.stat().st_size > 0:
+                return str(out_wav)
             return None
 
         voice_preview_btn.click(_preview_voice, voice, voice_preview_audio)
