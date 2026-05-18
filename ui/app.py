@@ -1199,8 +1199,29 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
         with gr.Row():
             voice = gr.Dropdown(
                 TTS_VOICES_ZH_TW, value="Meijia", label="TTS 語音 (zh_TW)",
+                scale=2,
             )
-            burn_subtitle = gr.Checkbox(value=True, label="燒入字幕")
+            voice_preview_btn = gr.Button("試聽", size="sm", scale=1)
+            burn_subtitle = gr.Checkbox(value=True, label="燒入字幕", scale=2)
+        voice_preview_audio = gr.Audio(
+            label="試聽結果", interactive=False, autoplay=True,
+        )
+
+        def _preview_voice(voice_name):
+            if not voice_name:
+                return None
+            preview_dir = OUT_DIR / "_voice_preview"
+            preview_dir.mkdir(exist_ok=True)
+            out_aiff = preview_dir / f"{voice_name}.aiff"
+            sample = "你好，這是這個聲音的試聽範例。" \
+                     "可以聽聽語速、音調和咬字是否合你的偏好。"
+            if tts_to_aiff(sample, voice_name, out_aiff):
+                return str(out_aiff)
+            return None
+
+        voice_preview_btn.click(_preview_voice, voice, voice_preview_audio)
+        # dropdown 切換也順便試聽
+        voice.change(_preview_voice, voice, voice_preview_audio)
         with gr.Row():
             with gr.Column(scale=3):
                 i2v_mode_select = gr.Radio(
