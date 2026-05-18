@@ -307,6 +307,106 @@ def stream_flux(prompt: str, model_key: str, count: int, aspect: str,
 
 
 # ============================================================
+# v3ctor.net scraper（Hugo 靜態站，<article> + <h1> + <p> 結構）
+# ============================================================
+
+V3CTOR_HOST = "v3ctor.net"
+
+
+def scrape_v3ctor(url: str) -> dict:
+    """從 v3ctor.net 抓單篇文章，回傳 {title, description, body, url}。
+
+    僅支援 v3ctor.net 網域；用 stdlib（urllib + re）解析 Hugo 生成的 HTML。
+    """
+    from urllib.request import Request, urlopen
+    from urllib.parse import urlparse
+
+    if not url or not url.startswith("http"):
+        raise ValueError("URL 必須以 http(s):// 開頭")
+    if V3CTOR_HOST not in urlparse(url).netloc:
+        raise ValueError(f"僅支援 {V3CTOR_HOST} 的 URL")
+
+    req = Request(url, headers={
+        "User-Agent": "Mozilla/5.0 ltx-mlx-director/scraper",
+    })
+    with urlopen(req, timeout=30) as r:
+        html = r.read().decode("utf-8", errors="replace")
+
+    # 標題
+    m = re.search(r"<h1[^>]*>(.*?)</h1>", html, re.S)
+    title = re.sub(r"<[^>]+>", "", m.group(1)).strip() if m else ""
+
+    # OG description（一句話 hook）
+    m = re.search(
+        r'<meta\s+(?:name|property)=["\'](?:og:)?description["\']\s+content=["\']([^"\']+)["\']',
+        html,
+    )
+    description = m.group(1).strip() if m else ""
+
+    # <article> 內的 <p> / <h2> / <h3>，按出現順序
+    paragraphs: list[str] = []
+    m = re.search(r"<article[^>]*>(.*?)</article>", html, re.S)
+    if m:
+        article = m.group(1)
+        for tag_match in re.finditer(
+            r"<(p|h2|h3)[^>]*>(.*?)</\1>", article, re.S,
+        ):
+            content = tag_match.group(2)
+            text = re.sub(r"<[^>]+>", "", content)
+            text = re.sub(r"\s+", " ", text).strip()
+            # 過濾掉太短的雜訊（如「· 0 分鐘閱讀」「· 15 字」）
+            if len(text) > 12 and "分鐘閱讀" not in text and "字 ·" not in text:
+                paragraphs.append(text)
+
+    return {
+        "title": title,
+        "description": description,
+        "body": "\n\n".join(paragraphs),
+        "url": url,
+    }
+
+
+def split_to_shots(text: str, mode: str, target_chars: int = 35) -> list[str]:
+    """把長文拆成多鏡，每鏡一行（給 Tab 0 story_text 用）。
+
+    mode:
+      段落 - 每段一鏡（粗）
+      句子 - 每句一鏡（細）
+      智能 - 合併短句到 target_chars 字上限（平衡）
+    """
+    if not text:
+        return []
+    if mode == "段落":
+        return [p.strip() for p in text.split("\n\n") if p.strip()]
+    if mode == "句子":
+        parts = re.split(r"(?<=[。！？.!?])\s*", text)
+        return [s.strip() for s in parts if s.strip()]
+    # 智能
+    parts = re.split(r"(?<=[。！？.!?])\s*", text)
+    shots: list[str] = []
+    cur = ""
+    for s in parts:
+        s = s.strip()
+        if not s:
+            continue
+        if cur and (len(cur) + len(s)) > target_chars:
+            shots.append(cur)
+            cur = s
+        else:
+            cur = (cur + s).strip()
+    if cur:
+        shots.append(cur)
+    return shots
+
+
+SPLIT_MODE_LABELS = {
+    "智能（合併短句到目標字數，最自然）": "智能",
+    "句子（每個句號斷一鏡，最細）": "句子",
+    "段落（每段一鏡，最粗）": "段落",
+}
+
+
+# ============================================================
 # 故事一鍵生成 pipeline 用的 subprocess 串流 helper
 # ============================================================
 
@@ -1086,6 +1186,32 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
                 "每鏡都會用該行作為圖片 prompt（接上風格詞）也作為旁白文字。"
             )
 
+            with gr.Accordion("從 v3ctor.net 抓素材（選填）", open=False):
+                gr.Markdown(
+                    "貼一篇 https://v3ctor.net/stories/... 的 URL，"
+                    "自動抓標題與內文，按選定策略拆鏡頭填入下方故事腳本。"
+                )
+                with gr.Row():
+                    v3_url = gr.Textbox(
+                        label="文章 URL",
+                        placeholder="https://v3ctor.net/stories/動物/s086-alex-parrot-.../",
+                        scale=4,
+                    )
+                with gr.Row():
+                    v3_split_mode = gr.Dropdown(
+                        list(SPLIT_MODE_LABELS), value=list(SPLIT_MODE_LABELS)[0],
+                        label="拆鏡策略", scale=2,
+                    )
+                    v3_target_chars = gr.Slider(
+                        15, 80, value=35, step=5,
+                        label="目標字數／鏡（智能模式才生效）", scale=2,
+                    )
+                with gr.Row():
+                    v3_fetch_btn = gr.Button(
+                        "抓取並填入下方故事腳本", variant="primary",
+                    )
+                v3_info = gr.Markdown("")
+
             story_text = gr.Textbox(
                 label="故事腳本（每行一鏡）",
                 value=(
@@ -1126,6 +1252,32 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
                     info="預設勾選 → 直接 LTX 文字轉影片，最穩定可用。"
                           "取消勾選才會跑 FLUX/Z-Image 生圖（要 HF 登入或撞 mflux bug）。",
                 )
+
+            def _fetch_v3ctor_and_fill(url, mode_label, target):
+                if not url or not url.strip():
+                    return gr.update(), "請先貼 v3ctor.net 的文章 URL"
+                try:
+                    article = scrape_v3ctor(url.strip())
+                except Exception as e:
+                    return gr.update(), f"抓取失敗：`{type(e).__name__}` {e}"
+                mode = SPLIT_MODE_LABELS.get(mode_label, "智能")
+                shots = split_to_shots(article["body"], mode, int(target))
+                if not shots:
+                    return gr.update(), f"抓到《{article['title']}》但拆不出鏡頭"
+                avg = sum(len(s) for s in shots) // len(shots)
+                hook = f"\n\n_{article['description']}_" if article['description'] else ""
+                info = (
+                    f"**《{article['title']}》**{hook}\n\n"
+                    f"已拆出 **{len(shots)} 鏡**（{mode}，平均 {avg} 字/鏡），"
+                    f"填入下方故事腳本。可手動調整後再按生成。"
+                )
+                return "\n".join(shots), info
+
+            v3_fetch_btn.click(
+                _fetch_v3ctor_and_fill,
+                [v3_url, v3_split_mode, v3_target_chars],
+                [story_text, v3_info],
+            )
 
             story_run_btn = gr.Button(
                 "一鍵生成全部（圖 → 動畫 → 旁白 → 字幕 → 串接）",
