@@ -317,13 +317,12 @@ def post_process_shot(shot_video: Path, narration: str, duration: float,
 # AI 靜圖生成（mflux subprocess）
 # ============================================================
 
+# 只保留實測可行的：FLUX 系列（需 HF 授權）。
+# 移除 z-image-turbo / z-image / qwen / fibo-lite — mflux adapter 全部假設有
+# text_encoder_2/ 目錄但 Tongyi/Qwen 上游 repo 沒有，撞 FileNotFoundError。
 FLUX_MODELS = {
-    "qwen (Qwen-Image，開放，推薦先試)": ("qwen", 8),
-    "fibo-lite (Hailuo Fibo Lite，開放)": ("fibo-lite", 8),
-    "schnell (FLUX.1-schnell，需 HF 接受授權)": ("schnell", 4),
-    "dev (FLUX.1-dev，需 HF 接受授權)": ("dev", 25),
-    "z-image-turbo（mflux 整合 BUG，慎用）": ("z-image-turbo", 8),
-    "z-image（mflux 整合 BUG，慎用）": ("z-image", 30),
+    "schnell (FLUX.1-schnell，需 HF agree)": ("schnell", 4),
+    "dev (FLUX.1-dev，需 HF agree)": ("dev", 25),
 }
 
 
@@ -357,12 +356,18 @@ def build_flux_cmd(prompt: str, model_key: str, aspect: str,
 
 def _flux_error_hint(log_text: str) -> str:
     """從 log 偵測常見錯誤並回傳可執行的提示。"""
+    if "text_encoder_2" in log_text and "No safetensors" in log_text:
+        return (
+            "\n        提示：mflux 對 z-image / qwen / fibo-lite 等開放模型的 "
+            "adapter 有 bug（期待 text_encoder_2/ 目錄但上游 repo 沒有）。"
+            "建議勾選「純 t2v 模式」跳過靜圖生成，或改用 FLUX 但需 HF 接受授權。"
+        )
     if "401" in log_text or "GatedRepoError" in log_text or "Unauthorized" in log_text:
         return (
-            "\n        提示：FLUX.1 是 gated repo。請改選「z-image-turbo（開放）」，"
-            "或先到 https://huggingface.co/black-forest-labs/FLUX.1-schnell "
-            "接受授權，然後跑 `huggingface-cli login`（會把 token 存到 "
-            "~/.cache/huggingface/token），重啟 UI 即可。"
+            "\n        提示：FLUX.1 是 gated repo。請先到 "
+            "https://huggingface.co/black-forest-labs/FLUX.1-schnell 接受授權，"
+            "然後跑 `hf auth login`（會把 token 存到 ~/.cache/huggingface/token），"
+            "重啟 UI 即可。或勾選「純 t2v 模式」跳過靜圖。"
         )
     return ""
 
@@ -725,21 +730,26 @@ def stream_story_pipeline(
 
             if not (img_path.exists() and img_path.stat().st_size > 0):
                 hint = _flux_error_hint("\n".join(log_lines[-15:]))
-                log_lines.append(f"[1/3] FLUX 失敗 rc={rc_flux}，跳過此鏡{hint}")
-                yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: FLUX 失敗"
-                continue
-            log_lines.append(f"[1/3] FLUX 完成: {img_path.name}")
-            img_path_for_ltx = str(img_path)
+                log_lines.append(
+                    f"[1/3] FLUX 失敗 rc={rc_flux}，降級為純 t2v 繼續此鏡{hint}"
+                )
+                yield "\n".join(log_lines[-40:]), completed, None, \
+                    f"Shot {shot_idx}: FLUX 失敗，t2v fallback"
+                img_path_for_ltx = ""  # 沒圖，LTX 走 t2v 路徑
+            else:
+                log_lines.append(f"[1/3] FLUX 完成: {img_path.name}")
+                img_path_for_ltx = str(img_path)
 
         # --- 2/3: LTX（t2v 或 i2v）---
         vid_path = OUT_DIR / f"{base}_{shot_idx:02d}.mp4"
         # 純 t2v 模式下，prompt 用 motion + narration 才能描述場景
+        # 沒圖（skip 或 FLUX 失敗）→ prompt 加上場景描述；有圖 → 只描述鏡頭運動
         ltx_prompt = (
             f"{motion}. {style_prompt}. {narration}"
-            if skip_image else motion
+            if not img_path_for_ltx else motion
         )
         log_lines.append(
-            f"[2/3] LTX {'t2v' if skip_image else 'i2v'}: {ltx_prompt[:120]}"
+            f"[2/3] LTX {'t2v' if not img_path_for_ltx else 'i2v'}: {ltx_prompt[:120]}"
         )
         yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: 動畫中"
 
