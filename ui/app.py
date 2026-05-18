@@ -651,6 +651,7 @@ def stream_story_pipeline(
     i2v_mode_label: str = list(I2V_MODES)[0],
     skip_image: bool = False,
     video_engine_label: str = list(VIDEO_ENGINES)[0],
+    image_theme: str = "",
     progress=gr.Progress(),
 ):
     """每行 = 一鏡頭。對每行：FLUX 出圖 → LTX i2v 雙錨 → TTS+字幕 → concat。"""
@@ -666,6 +667,7 @@ def stream_story_pipeline(
     # Gradio textbox 為空時可能傳 None，先做 None 防護
     custom_style = (custom_style or "").strip()
     motion_prompt = (motion_prompt or "").strip()
+    image_theme = (image_theme or "").strip()
 
     if style_preset == "自訂":
         style_prompt = custom_style or "cinematic"
@@ -713,7 +715,9 @@ def stream_story_pipeline(
             img_path_for_ltx = ""  # build_cmd 收到空字串 → t2v 路徑
         else:
             img_path = OUT_DIR / f"{base}_{shot_idx:02d}.png"
-            img_prompt = f"{style_prompt}. {narration}"
+            # image_theme 有值 → 用主題鎖定主體；空 → 用該行旁白當主體
+            subject = image_theme if image_theme else narration
+            img_prompt = f"{style_prompt}. {subject}"
             log_lines.append(f"[1/3] FLUX: {img_prompt[:120]}")
             yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: 生圖中"
 
@@ -1459,6 +1463,11 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
                     value=4, label="每鏡秒數", precision=1,
                     minimum=2, maximum=10,
                 )
+            image_theme = gr.Textbox(
+                label="圖片主題（選填，固定畫面主體；空白 = 用每行旁白）",
+                placeholder="例：an elderly fisherman in Taiwanese fishing village, weathered face",
+                lines=1,
+            )
 
             # --- 進階：URL/拆鏡/風格補強/動作/跳圖 ---
             with gr.Accordion("進階設定（一般不用改）", open=False):
@@ -1886,7 +1895,7 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
         [story_text, story_style, story_custom_style, story_sec, story_motion,
          aspect, fps, seed, model, enhance, voice, burn_subtitle, mode,
          bgm_file, bgm_volume, i2v_mode_select, skip_image_gen,
-         video_engine_select],
+         video_engine_select, image_theme],
         [story_log, completed_state, story_final_video, story_status],
     ).then(update_gallery_from_state, completed_state, shot_gallery)
 
