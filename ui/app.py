@@ -658,14 +658,18 @@ def stream_story_pipeline(
         yield "故事為空", [], None, "未開始"
         return
 
+    # Gradio textbox 為空時可能傳 None，先做 None 防護
+    custom_style = (custom_style or "").strip()
+    motion_prompt = (motion_prompt or "").strip()
+
     if style_preset == "自訂":
-        style_prompt = custom_style.strip() or "cinematic"
+        style_prompt = custom_style or "cinematic"
     else:
         style_prompt = STYLE_PRESETS.get(style_preset, "cinematic")
-        if custom_style.strip():
-            style_prompt = f"{style_prompt}, {custom_style.strip()}"
+        if custom_style:
+            style_prompt = f"{style_prompt}, {custom_style}"
 
-    motion = motion_prompt.strip() or "subtle cinematic camera movement"
+    motion = motion_prompt or "subtle cinematic camera movement"
     base_seed = (int(datetime.now().timestamp()) % (10 ** 8)
                   if int(seed) == -1 else int(seed))
 
