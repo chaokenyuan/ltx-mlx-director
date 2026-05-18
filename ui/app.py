@@ -1248,47 +1248,75 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
         # ============================ Tab 0: 故事一鍵生成（推薦）==============================
         with gr.Tab("故事一鍵生成（推薦）"):
             gr.Markdown(
-                "**預設工作流**：從 v3ctor.net 選一篇 → 按「🚀 抓 + 一鍵生成」"
-                "→ 自動拆鏡 / 動畫 / 旁白 / 字幕 / 串接，產出最終影片。\n\n"
-                "想自寫劇本？跳過下方 v3ctor 區，直接在「故事腳本」textbox 編輯，"
-                "按「一鍵生成全部」即可（每行 = 一鏡）。"
+                "選文章 → 按 🚀 生成 → 等影片。其餘細節在「進階設定」裡。"
             )
 
-            # --- v3ctor.net 文章選取（預設工作流入口）---
-            gr.Markdown("### 從 v3ctor.net 選文章")
+            # --- 主畫面：只留必要 3 個元件 ---
             _initial_articles = list_v3ctor_articles(50)
             _initial_choices = [
                 (_format_article_label(a), a["url"]) for a in _initial_articles
             ]
             _initial_url = _initial_articles[0]["url"] if _initial_articles else ""
 
+            v3_article_dd = gr.Dropdown(
+                choices=_initial_choices,
+                value=_initial_url or None,
+                label=f"選一篇 v3ctor.net 文章（共 {len(_initial_articles)} 篇）",
+                interactive=True,
+            )
+
+            story_text = gr.Textbox(
+                label="故事腳本（每行 = 一鏡，空白 → 自動從上方文章抓）",
+                value="",
+                lines=8,
+                placeholder="留空白讓系統自動抓取，或自己寫每行一鏡的腳本",
+            )
+
             with gr.Row():
-                v3_article_dd = gr.Dropdown(
-                    choices=_initial_choices,
-                    value=_initial_url or None,
-                    label=f"最新文章（共 {len(_initial_articles)} 篇，依 lastmod 排序）",
-                    scale=4, interactive=True,
+                story_style = gr.Dropdown(
+                    list(STYLE_PRESETS), value="寫實電影風",
+                    label="視覺風格",
                 )
-                v3_refresh_btn = gr.Button("重新載入清單", scale=1)
-            with gr.Row():
+                story_sec = gr.Number(
+                    value=4, label="每鏡秒數", precision=1,
+                    minimum=2, maximum=10,
+                )
+
+            # --- 進階：URL/拆鏡/風格補強/動作/跳圖 ---
+            with gr.Accordion("進階設定（一般不用改）", open=False):
                 v3_url = gr.Textbox(
                     value=_initial_url,
-                    label="URL（可手動改成任何 v3ctor.net/stories/... 的網址）",
-                    scale=4,
+                    label="URL（換站或非 sitemap 文章時改這個）",
                 )
-            with gr.Row():
-                v3_split_mode = gr.Dropdown(
-                    list(SPLIT_MODE_LABELS), value=list(SPLIT_MODE_LABELS)[0],
-                    label="拆鏡策略", scale=2,
+                with gr.Row():
+                    v3_refresh_btn = gr.Button("重新載入文章清單", scale=1)
+                    v3_fetch_btn = gr.Button(
+                        "抓取（只預覽，不生成）", scale=1,
+                    )
+                with gr.Row():
+                    v3_split_mode = gr.Dropdown(
+                        list(SPLIT_MODE_LABELS), value=list(SPLIT_MODE_LABELS)[0],
+                        label="拆鏡策略",
+                    )
+                    v3_target_chars = gr.Slider(
+                        15, 80, value=35, step=5,
+                        label="智能模式：目標字數／鏡",
+                    )
+                story_custom_style = gr.Textbox(
+                    label="風格 prompt 補強",
+                    placeholder="例：golden hour, fog, low angle",
+                    lines=1,
                 )
-                v3_target_chars = gr.Slider(
-                    15, 80, value=35, step=5,
-                    label="目標字數／鏡（智能模式才生效）", scale=2,
+                story_motion = gr.Textbox(
+                    label="動作 prompt（鏡頭運動描述）",
+                    value="subtle cinematic zoom in, smooth camera, atmospheric",
+                    lines=1,
                 )
-            with gr.Row():
-                v3_fetch_btn = gr.Button(
-                    "抓取（預覽用，只填入下方腳本）", scale=1,
+                skip_image_gen = gr.Checkbox(
+                    value=True,
+                    label="純 t2v 模式（預設開，最穩定）",
                 )
+
             v3_info = gr.Markdown("")
 
             # dropdown 變更 → 同步 URL textbox
@@ -1309,48 +1337,6 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
             v3_refresh_btn.click(
                 _reload_articles, None, [v3_article_dd, v3_url, v3_info],
             )
-
-            gr.Markdown("### 故事腳本（每行 = 一鏡，可自寫或讓上方抓取自動填）")
-
-            story_text = gr.Textbox(
-                label="故事腳本（每行一鏡，可空白讓上方 v3ctor 自動填）",
-                value="",
-                lines=8,
-                placeholder=(
-                    "空白時：上方按 🚀 會先抓 v3ctor 文章再生成。\n"
-                    "想自寫：直接打字，每行一鏡（範例：「在某個小漁村...」）。"
-                ),
-            )
-
-            with gr.Row():
-                story_style = gr.Dropdown(
-                    list(STYLE_PRESETS), value="寫實電影風",
-                    label="視覺風格（套到所有鏡頭圖 prompt）",
-                )
-                story_custom_style = gr.Textbox(
-                    label="風格 prompt 補強（會接在風格之後，英文較好）",
-                    placeholder="golden hour, fog, low angle",
-                    lines=2,
-                )
-
-            with gr.Row():
-                story_sec = gr.Number(
-                    value=4, label="每鏡秒數", precision=1,
-                    minimum=2, maximum=10,
-                )
-                story_motion = gr.Textbox(
-                    label="動作 prompt（套到所有鏡頭的 LTX，描述鏡頭運動）",
-                    value="subtle cinematic zoom in, smooth camera, atmospheric",
-                    lines=2,
-                )
-
-            with gr.Row():
-                skip_image_gen = gr.Checkbox(
-                    value=True,
-                    label="純 t2v 模式（推薦預設，免裝靜圖模型）",
-                    info="預設勾選 → 直接 LTX 文字轉影片，最穩定可用。"
-                          "取消勾選才會跑 FLUX/Z-Image 生圖（要 HF 登入或撞 mflux bug）。",
-                )
 
             def _fetch_v3ctor_and_fill(url, mode_label, target):
                 if not url or not url.strip():
