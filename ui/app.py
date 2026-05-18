@@ -1240,8 +1240,11 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
 
     completed_state = gr.State([])
     flux_state = gr.State([])
+    # Gradio 6.x tab 切換有時會 visual reset textbox，用 State 備份 story_text 內容
+    story_text_state = gr.State("")
 
-    with gr.Tabs():
+    tabs = gr.Tabs()
+    with tabs:
         # ============================ Tab 0: 故事一鍵生成（推薦）==============================
         with gr.Tab("故事一鍵生成（推薦）"):
             gr.Markdown(
@@ -1683,6 +1686,12 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
 
     def clear_completed():
         return [], [], None, "已清空完成清單"
+
+    # 備份 story_text 內容到 State：使用者每次編輯 / scraper 寫入時同步
+    story_text.change(lambda x: x, story_text, story_text_state)
+
+    # tab 切換時把 State 還原回 story_text（修 Gradio 6.x lazy render 重置）
+    tabs.select(lambda s: s, story_text_state, story_text)
 
     def _maybe_scrape_first(existing_story_text, url, mode_label, target):
         """智能 pre-step：若 story_text 空白且 URL 有值 → 從 v3ctor 抓回填；
