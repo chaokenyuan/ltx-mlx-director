@@ -1184,34 +1184,31 @@ CSS = """
 """
 
 with gr.Blocks(title="LTX-2.3 Director") as app:
-    gr.Markdown("# LTX-2.3 Director\n本地（MLX）影片導演面板。先設全域、再寫分鏡、按生成。")
+    gr.Markdown("# LTX-2.3 Director")
 
-    with gr.Row():
-        aspect = gr.Dropdown(list(ASPECT_WH), value="16:9", label="畫面比例")
-        fps = gr.Dropdown([24, 30, 60], value=24, label="FPS")
-        mode = gr.Dropdown(list(MODE_FLAGS), value=list(MODE_FLAGS)[0], label="模式")
-        seed = gr.Number(value=-1, label="Seed（-1 = 隨機）", precision=0)
-        default_dur = gr.Number(value=4, label="新鏡頭預設秒數", precision=1)
-    with gr.Row():
-        model = gr.Textbox(value="dgrauet/ltx-2.3-mlx-q4", label="模型 (HF repo)")
-        enhance = gr.Checkbox(value=False, label="Gemma 自動改寫 prompt")
-    with gr.Row():
-        voice = gr.Dropdown(
-            TTS_VOICES_ZH_TW, value="Meijia",
-            label="TTS 語音（zh_TW，旁白用）",
-        )
-        burn_subtitle = gr.Checkbox(
-            value=True, label="燒入字幕（中文 PingFang）",
-        )
-    with gr.Row():
-        with gr.Column(scale=3):
-            i2v_mode_select = gr.Radio(
-                choices=list(I2V_MODES),
-                value=list(I2V_MODES)[0],
-                label="i2v 識別保留模式（有參考圖時生效）",
-                info="ic-lora 用 canny 邊緣控制每一幀，全程身份鎖定，比 two-stage 快",
+    with gr.Accordion("全域設定（一般不用改）", open=False):
+        with gr.Row():
+            aspect = gr.Dropdown(list(ASPECT_WH), value="16:9", label="畫面比例")
+            fps = gr.Dropdown([24, 30, 60], value=24, label="FPS")
+            mode = gr.Dropdown(list(MODE_FLAGS), value=list(MODE_FLAGS)[0], label="模式")
+            seed = gr.Number(value=-1, label="Seed（-1=隨機）", precision=0)
+            default_dur = gr.Number(value=4, label="預設秒數", precision=1)
+        with gr.Row():
+            model = gr.Textbox(value="dgrauet/ltx-2.3-mlx-q4", label="模型 (HF repo)")
+            enhance = gr.Checkbox(value=False, label="Gemma 改寫 prompt")
+        with gr.Row():
+            voice = gr.Dropdown(
+                TTS_VOICES_ZH_TW, value="Meijia", label="TTS 語音 (zh_TW)",
             )
-        with gr.Column(scale=1):
+            burn_subtitle = gr.Checkbox(value=True, label="燒入字幕")
+        with gr.Row():
+            with gr.Column(scale=3):
+                i2v_mode_select = gr.Radio(
+                    choices=list(I2V_MODES),
+                    value=list(I2V_MODES)[0],
+                    label="i2v 識別保留模式（有參考圖時生效）",
+                )
+            with gr.Column(scale=1):
             _lora_ok, _lora_gb = is_lora_cached(IC_LORA_UNION_CONTROL)
             _lora_status_text = (
                 f"IC-LoRA Union Control: 已下載 ({_lora_gb:.1f} GB)"
