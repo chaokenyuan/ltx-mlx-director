@@ -205,10 +205,12 @@ def post_process_shot(shot_video: Path, narration: str, duration: float,
 # ============================================================
 
 FLUX_MODELS = {
-    "z-image-turbo（開放，快，推薦）": ("z-image-turbo", 8),
-    "z-image（開放，較精細）": ("z-image", 30),
+    "qwen (Qwen-Image，開放，推薦先試)": ("qwen", 8),
+    "fibo-lite (Hailuo Fibo Lite，開放)": ("fibo-lite", 8),
     "schnell (FLUX.1-schnell，需 HF 接受授權)": ("schnell", 4),
     "dev (FLUX.1-dev，需 HF 接受授權)": ("dev", 25),
+    "z-image-turbo（mflux 整合 BUG，慎用）": ("z-image-turbo", 8),
+    "z-image（mflux 整合 BUG，慎用）": ("z-image", 30),
 }
 
 
@@ -364,6 +366,7 @@ def stream_story_pipeline(
     voice: str, burn_subtitle: bool, mode_label: str,
     bgm_file_in=None, bgm_volume_in: float = -15.0,
     i2v_mode_label: str = list(I2V_MODES)[0],
+    skip_image: bool = False,
     progress=gr.Progress(),
 ):
     """每行 = 一鏡頭。對每行：FLUX 出圖 → LTX i2v 雙錨 → TTS+字幕 → concat。"""
@@ -415,37 +418,50 @@ def stream_story_pipeline(
             yield "\n".join(log_lines[-40:]), completed, None, \
                   f"Shot {shot_idx}: 延長為 {actual_sec}s"
 
-        # --- 1/3: FLUX 靜圖 ---
-        img_path = OUT_DIR / f"{base}_{shot_idx:02d}.png"
-        img_prompt = f"{style_prompt}. {narration}"
-        log_lines.append(f"[1/3] FLUX: {img_prompt[:120]}")
-        yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: 生圖中"
+        # --- 1/3: FLUX 靜圖（或跳過走純 t2v）---
+        if skip_image:
+            log_lines.append("[1/3] 跳過靜圖生成（純 t2v 模式）")
+            yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: 跳過靜圖"
+            img_path_for_ltx = ""  # build_cmd 收到空字串 → t2v 路徑
+        else:
+            img_path = OUT_DIR / f"{base}_{shot_idx:02d}.png"
+            img_prompt = f"{style_prompt}. {narration}"
+            log_lines.append(f"[1/3] FLUX: {img_prompt[:120]}")
+            yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: 生圖中"
 
-        flux_cmd = build_flux_cmd(
-            img_prompt, list(FLUX_MODELS)[0], aspect,
-            base_seed + i * 17, img_path,
-        )
-        rc_flux = None
-        for item in _stream_subprocess(flux_cmd, log_lines):
-            if isinstance(item, int):
-                rc_flux = item
-            else:
-                yield item, completed, None, f"Shot {shot_idx}: 生圖中"
+            flux_cmd = build_flux_cmd(
+                img_prompt, list(FLUX_MODELS)[0], aspect,
+                base_seed + i * 17, img_path,
+            )
+            rc_flux = None
+            for item in _stream_subprocess(flux_cmd, log_lines):
+                if isinstance(item, int):
+                    rc_flux = item
+                else:
+                    yield item, completed, None, f"Shot {shot_idx}: 生圖中"
 
-        if not (img_path.exists() and img_path.stat().st_size > 0):
-            hint = _flux_error_hint("\n".join(log_lines[-15:]))
-            log_lines.append(f"[1/3] FLUX 失敗 rc={rc_flux}，跳過此鏡{hint}")
-            yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: FLUX 失敗"
-            continue
-        log_lines.append(f"[1/3] FLUX 完成: {img_path.name}")
+            if not (img_path.exists() and img_path.stat().st_size > 0):
+                hint = _flux_error_hint("\n".join(log_lines[-15:]))
+                log_lines.append(f"[1/3] FLUX 失敗 rc={rc_flux}，跳過此鏡{hint}")
+                yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: FLUX 失敗"
+                continue
+            log_lines.append(f"[1/3] FLUX 完成: {img_path.name}")
+            img_path_for_ltx = str(img_path)
 
-        # --- 2/3: LTX i2v 雙錨 ---
+        # --- 2/3: LTX（t2v 或 i2v）---
         vid_path = OUT_DIR / f"{base}_{shot_idx:02d}.mp4"
-        log_lines.append(f"[2/3] LTX i2v: {motion}")
+        # 純 t2v 模式下，prompt 用 motion + narration 才能描述場景
+        ltx_prompt = (
+            f"{motion}. {style_prompt}. {narration}"
+            if skip_image else motion
+        )
+        log_lines.append(
+            f"[2/3] LTX {'t2v' if skip_image else 'i2v'}: {ltx_prompt[:120]}"
+        )
         yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: 動畫中"
 
         ltx_cmd, mode_tag = build_cmd(
-            motion, actual_sec, str(img_path),
+            ltx_prompt, actual_sec, img_path_for_ltx,
             aspect, int(fps), mode_label,
             base_seed + i * 17, model, enhance, vid_path,
             i2v_mode=I2V_MODES.get(i2v_mode_label, "ic-lora-canny"),
@@ -1103,6 +1119,14 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
                     lines=2,
                 )
 
+            with gr.Row():
+                skip_image_gen = gr.Checkbox(
+                    value=False,
+                    label="跳過靜圖生成（純 t2v，最穩定）",
+                    info="勾選 → 直接用 LTX 文字轉影片，跳過 FLUX/Z-Image 階段。"
+                          "適合：mflux 靜圖出問題、或不想下載額外模型時。",
+                )
+
             story_run_btn = gr.Button(
                 "一鍵生成全部（圖 → 動畫 → 旁白 → 字幕 → 串接）",
                 variant="primary", size="lg",
@@ -1417,7 +1441,7 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
         stream_story_pipeline,
         [story_text, story_style, story_custom_style, story_sec, story_motion,
          aspect, fps, seed, model, enhance, voice, burn_subtitle, mode,
-         bgm_file, bgm_volume, i2v_mode_select],
+         bgm_file, bgm_volume, i2v_mode_select, skip_image_gen],
         [story_log, completed_state, story_final_video, story_status],
     ).then(update_gallery_from_state, completed_state, shot_gallery)
 
