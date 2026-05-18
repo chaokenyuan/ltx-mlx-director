@@ -1284,11 +1284,7 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
                 )
             with gr.Row():
                 v3_fetch_btn = gr.Button(
-                    "抓取（填入下方故事腳本，不生成）", scale=1,
-                )
-                v3_run_btn = gr.Button(
-                    "🚀 抓 + 一鍵生成（最少操作）",
-                    variant="primary", scale=2, size="lg",
+                    "抓取（預覽用，只填入下方腳本）", scale=1,
                 )
             v3_info = gr.Markdown("")
 
@@ -1314,14 +1310,13 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
             gr.Markdown("### 故事腳本（每行 = 一鏡，可自寫或讓上方抓取自動填）")
 
             story_text = gr.Textbox(
-                label="故事腳本（每行一鏡）",
-                value=(
-                    "在台灣東部的某個小漁村，住著一位八十歲的老漁夫。\n"
-                    "每天清晨，他會踏上熟悉的礁石小路，等待海鳥啟程的瞬間。\n"
-                    "據說那一刻，整片海洋會跟著呼吸。"
-                ),
+                label="故事腳本（每行一鏡，可空白讓上方 v3ctor 自動填）",
+                value="",
                 lines=8,
-                placeholder="一行寫一個鏡頭，會自動拆分...",
+                placeholder=(
+                    "空白時：上方按 🚀 會先抓 v3ctor 文章再生成。\n"
+                    "想自寫：直接打字，每行一鏡（範例：「在某個小漁村...」）。"
+                ),
             )
 
             with gr.Row():
@@ -1381,7 +1376,7 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
             )
 
             story_run_btn = gr.Button(
-                "一鍵生成全部（圖 → 動畫 → 旁白 → 字幕 → 串接）",
+                "🚀 生成影片（腳本空白會自動從上方 URL 抓取）",
                 variant="primary", size="lg",
             )
             story_status = gr.Markdown("尚未開始")
@@ -1689,19 +1684,29 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
     def clear_completed():
         return [], [], None, "已清空完成清單"
 
-    # 三個 generate 入口都更新 completed_state，並都會觸發 gallery 重繪
-    story_run_btn.click(
-        stream_story_pipeline,
-        [story_text, story_style, story_custom_style, story_sec, story_motion,
-         aspect, fps, seed, model, enhance, voice, burn_subtitle, mode,
-         bgm_file, bgm_volume, i2v_mode_select, skip_image_gen],
-        [story_log, completed_state, story_final_video, story_status],
-    ).then(update_gallery_from_state, completed_state, shot_gallery)
+    def _maybe_scrape_first(existing_story_text, url, mode_label, target):
+        """智能 pre-step：若 story_text 空白且 URL 有值 → 從 v3ctor 抓回填；
+        否則用現有 story_text。"""
+        if existing_story_text and existing_story_text.strip():
+            return existing_story_text, "使用手寫腳本"
+        if not url or not url.strip():
+            return "", "腳本與 URL 都空白 — 請至少填一個"
+        try:
+            article = scrape_v3ctor(url.strip())
+        except Exception as e:
+            return "", f"scrape 失敗：{type(e).__name__} {e}"
+        mode = SPLIT_MODE_LABELS.get(mode_label, "智能")
+        shots = split_to_shots(article["body"], mode, int(target))
+        if not shots:
+            return "", f"抓到《{article['title']}》但拆不出鏡頭"
+        return (
+            "\n".join(shots),
+            f"自動抓取：《{article['title']}》→ {len(shots)} 鏡",
+        )
 
-    # v3ctor: 抓取 + 一鍵生成（先 scrape 寫入 story_text，再跑 pipeline）
-    v3_run_btn.click(
-        _fetch_v3ctor_and_fill,
-        [v3_url, v3_split_mode, v3_target_chars],
+    story_run_btn.click(
+        _maybe_scrape_first,
+        [story_text, v3_url, v3_split_mode, v3_target_chars],
         [story_text, v3_info],
     ).then(
         stream_story_pipeline,
