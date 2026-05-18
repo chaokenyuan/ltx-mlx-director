@@ -11,6 +11,8 @@ MODE="fast"        # fast | hq
 IMAGE=""
 ENHANCE=0
 STORYBOARD=""
+I2V_MODE="ic-lora"   # ic-lora | two-stage（有圖時生效）
+IC_LORA_REPO="Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control"
 MODEL="${MODEL:-dgrauet/ltx-2.3-mlx-q4}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 REPO_DIR="$HOME/ltx-2-mlx"
@@ -34,6 +36,9 @@ usage() {
   -m, --mode MODE       fast = distilled (約 1 分鐘)
                         hq   = two-stages-hq (約 5+ 分鐘，更精緻)
   -i, --image PATH      i2v 起手圖
+  -I, --i2v-mode MODE   有圖時的身份保留模式（預設 ic-lora）
+                        ic-lora  = canny 邊緣控制每一幀（最強保留，最快）
+                        two-stage = 首尾雙錨 (CFG)（既有，中等保留）
       --enhance         用 Gemma 改寫 prompt
 
 分鏡:
@@ -64,6 +69,7 @@ while [ $# -gt 0 ]; do
     -s|--seed)     SEED="$2"; shift 2 ;;
     -m|--mode)     MODE="$2"; shift 2 ;;
     -i|--image)    IMAGE="$2"; shift 2 ;;
+    -I|--i2v-mode) I2V_MODE="$2"; shift 2 ;;
     --enhance)     ENHANCE=1; shift ;;
     --storyboard)  STORYBOARD="$2"; shift 2 ;;
     --) shift; while [ $# -gt 0 ]; do POSITIONAL+=("$1"); shift; done ;;
@@ -104,43 +110,97 @@ mode_flag() {
   esac
 }
 
+# ---------- canny 控制影片產生 ----------
+# 從靜圖以 ffmpeg edgedetect 產出 N 幀同樣 canny 邊緣的控制影片，
+# 給 ltx-2-mlx ic-lora 的 --video-conditioning 用。
+generate_canny_control() {
+  local img="$1" width="$2" height="$3" frames="$4" fps="$5" out="$6"
+  ffmpeg -y -hide_banner -loglevel error \
+    -loop 1 -i "$img" \
+    -vf "scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},edgedetect=mode=canny:low=0.1:high=0.4,format=yuv420p" \
+    -frames:v "$frames" -r "$fps" \
+    -c:v libx264 -preset veryfast -crf 18 \
+    "$out"
+  [ -s "$out" ]
+}
+
 # ---------- 單鏡執行 ----------
 #
-# 參考圖識別保留：當提供 -i / --image 時，覆寫 pipeline 為 --one-stage（含 CFG，
-# q4 可用），並加上頭尾雙錨 --image PATH 0 1.0 + --image PATH (frames-1) 1.0。
-# 因為 --distilled 模式 no CFG，圖只鎖第 0 幀，之後立即朝 prompt 飄走。
+# 有圖時依 I2V_MODE 切換：
+#   ic-lora  → generate_canny_control + ltx-2-mlx ic-lora（最強身份保留，最快）
+#   two-stage → ltx-2-mlx generate --two-stage + 頭尾雙錨（中等保留）
+# 無圖時用 mode_flag (distilled / hq) 做 t2v。
 run_shot() {
   local prompt="$1" out_path="$2" sec="$3"
-  local frames width height pipe i2v_lock=0
+  local frames width height
   read -r width height < <(aspect_to_wh "$ASPECT")
   frames=$(duration_to_frames "$sec" "$FPS")
-
-  local image_args=()
-  if [ -n "$IMAGE" ]; then
-    if [ ! -f "$IMAGE" ]; then
-      echo "找不到參考圖: $IMAGE" >&2
-      exit 1
-    fi
-    i2v_lock=1
-    # 注意：--one-stage 只支援單張單錨；多錨點 i2v 需要 --two-stage 或 --two-stages-hq
-    # help 寫 --two-stage requires q8，實測 q4 可用
-    pipe="--two-stage"
-    image_args=(--image "$IMAGE" 0 1.0 --image "$IMAGE" "$((frames - 1))" 1.0)
-  else
-    pipe=$(mode_flag "$MODE")
-  fi
 
   local enhance_args=()
   [ "$ENHANCE" -eq 1 ] && enhance_args=(--enhance-prompt)
 
   echo "  shot: \"$prompt\""
-  if [ "$i2v_lock" -eq 1 ]; then
-    echo "     size=${width}x${height}  frames=${frames}  fps=${FPS}  seed=${SEED}  mode=one-stage（i2v 鎖定，覆寫 ${MODE}）"
+
+  if [ -n "$IMAGE" ]; then
+    if [ ! -f "$IMAGE" ]; then
+      echo "找不到參考圖: $IMAGE" >&2
+      exit 1
+    fi
+
+    if [ "$I2V_MODE" = "ic-lora" ]; then
+      local canny_path="${out_path%.mp4}_canny.mp4"
+      echo "     size=${width}x${height}  frames=${frames}  fps=${FPS}  seed=${SEED}  mode=ic-lora canny（覆寫 ${MODE}）"
+      echo "     image=${IMAGE}"
+      echo "     [prep] 產生 canny 控制影片: $canny_path"
+      if ! generate_canny_control "$IMAGE" "$width" "$height" "$frames" "$FPS" "$canny_path"; then
+        echo "canny 控制影片產生失敗，回退 two-stage" >&2
+        I2V_MODE="two-stage"
+      else
+        cd "$REPO_DIR"
+        # shellcheck disable=SC2086
+        uv run ltx-2-mlx ic-lora \
+          -p "$prompt" \
+          --lora "$IC_LORA_REPO" 1.0 \
+          --video-conditioning "$canny_path" 1.0 \
+          --image "$IMAGE" \
+          --low-ram \
+          --width "$width" --height "$height" \
+          --frames "$frames" \
+          --frame-rate "$FPS" \
+          --seed "$SEED" \
+          --model "$MODEL" \
+          "${enhance_args[@]}" \
+          -o "$out_path" \
+          $EXTRA_ARGS
+        return $?
+      fi
+    fi
+
+    # two-stage 雙錨（or fallback from ic-lora 失敗）
+    echo "     size=${width}x${height}  frames=${frames}  fps=${FPS}  seed=${SEED}  mode=two-stage 雙錨（覆寫 ${MODE}）"
     echo "     image=${IMAGE}  雙端錨點 (0 + $((frames - 1)))"
-  else
-    echo "     size=${width}x${height}  frames=${frames}  fps=${FPS}  seed=${SEED}  mode=${MODE}"
+    cd "$REPO_DIR"
+    # shellcheck disable=SC2086
+    uv run ltx-2-mlx generate \
+      -p "$prompt" \
+      --two-stage --low-ram \
+      --width "$width" --height "$height" \
+      --frames "$frames" \
+      --frame-rate "$FPS" \
+      --seed "$SEED" \
+      --model "$MODEL" \
+      --image "$IMAGE" 0 1.0 \
+      --image "$IMAGE" "$((frames - 1))" 1.0 \
+      "${enhance_args[@]}" \
+      -o "$out_path" \
+      $EXTRA_ARGS
+    return $?
   fi
 
+  # 純 t2v
+  local pipe
+  pipe=$(mode_flag "$MODE")
+  echo "     size=${width}x${height}  frames=${frames}  fps=${FPS}  seed=${SEED}  mode=${MODE}"
   cd "$REPO_DIR"
   # shellcheck disable=SC2086
   uv run ltx-2-mlx generate \
@@ -151,7 +211,7 @@ run_shot() {
     --frame-rate "$FPS" \
     --seed "$SEED" \
     --model "$MODEL" \
-    "${image_args[@]}" "${enhance_args[@]}" \
+    "${enhance_args[@]}" \
     -o "$out_path" \
     $EXTRA_ARGS
 }

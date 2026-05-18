@@ -475,6 +475,23 @@ def stream_story_pipeline(
 # ============================================================
 
 IC_LORA_UNION_CONTROL = "Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control"
+HF_CACHE_DIR = Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def is_lora_cached(repo_id: str) -> tuple[bool, float]:
+    """檢查 HF hub cache 中是否已有此 repo。回傳 (是否存在, 大小 GB)。"""
+    folder_name = "models--" + repo_id.replace("/", "--")
+    target = HF_CACHE_DIR / folder_name
+    if not target.exists():
+        return False, 0.0
+    total = 0
+    for p in target.rglob("*"):
+        try:
+            if p.is_file():
+                total += p.stat().st_size
+        except OSError:
+            pass
+    return total > 0, total / 1024 / 1024 / 1024
 
 
 def generate_canny_control(image_path: Path, width: int, height: int,
@@ -982,12 +999,28 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
             value=True, label="燒入字幕（中文 PingFang）",
         )
     with gr.Row():
-        i2v_mode_select = gr.Radio(
-            choices=list(I2V_MODES),
-            value=list(I2V_MODES)[0],
-            label="i2v 識別保留模式（有參考圖時生效）",
-            info="ic-lora 用 canny 邊緣控制每一幀，全程身份鎖定，比 two-stage 快；首次跑會下載 Union Control LoRA 權重",
-        )
+        with gr.Column(scale=3):
+            i2v_mode_select = gr.Radio(
+                choices=list(I2V_MODES),
+                value=list(I2V_MODES)[0],
+                label="i2v 識別保留模式（有參考圖時生效）",
+                info="ic-lora 用 canny 邊緣控制每一幀，全程身份鎖定，比 two-stage 快",
+            )
+        with gr.Column(scale=1):
+            _lora_ok, _lora_gb = is_lora_cached(IC_LORA_UNION_CONTROL)
+            _lora_status_text = (
+                f"IC-LoRA Union Control: 已下載 ({_lora_gb:.1f} GB)"
+                if _lora_ok
+                else "IC-LoRA Union Control: 首跑會下載"
+            )
+            lora_status = gr.Markdown(_lora_status_text)
+            lora_recheck_btn = gr.Button("重新檢查 LoRA 狀態", size="sm")
+
+    def _refresh_lora_status():
+        ok, gb = is_lora_cached(IC_LORA_UNION_CONTROL)
+        return (f"IC-LoRA Union Control: 已下載 ({gb:.1f} GB)"
+                if ok else "IC-LoRA Union Control: 首跑會下載")
+    lora_recheck_btn.click(_refresh_lora_status, None, lora_status)
     with gr.Accordion("背景音樂（選填，會在最終 concat 後混入）", open=False):
         with gr.Row():
             bgm_file = gr.File(

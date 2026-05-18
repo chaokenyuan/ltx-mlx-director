@@ -165,14 +165,22 @@ EXTRA_ARGS="..." 附加 ltx-2-mlx 旗標（如 --cfg-scale 4.0）
 LTX-2.3 上游已知行為：所有 `generate` pipeline 中 `--image` 只作為「第 0 幀的初始化」，
 之後 4 秒內影片會朝 prompt 描述的分佈飄走（即使設定 STG=1.0 也一樣）。
 
-本工具的補救：當任一鏡頭含參考圖時，自動：
+本工具提供兩種補救（UI / CLI 皆可切換）：
 
-1. **覆寫 pipeline 為 `--two-stage`**（CFG + 半解析度雙階段 + distilled LoRA refine，q4 可用）— 因為 `--distilled` 無 CFG 圖像條件最弱，而 `--one-stage` 不支援多錨點 i2v。
-2. **頭尾雙端錨點**：`--image PATH 0 1.0 --image PATH (frames-1) 1.0`，鎖住首尾兩幀為同一張圖。
+**模式 A：ic-lora + canny（預設，推薦）**
+- ffmpeg `edgedetect=mode=canny` 從參考圖產生 N 幀同樣邊緣的控制影片
+- `ltx-2-mlx ic-lora --lora Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control 1.0 --video-conditioning CANNY.mp4 1.0 --image IMG`
+- 每一幀都被 canny 邊緣控制，**全程身份鎖定**
+- 比 two-stage 快 4×（distilled defaults: 8+3 steps, no CFG）
+- 首次跑會額外下載 Union Control LoRA 權重（幾百 MB）
 
-代價：速度慢 2-3 倍（`--distilled` 約 1 分鐘 → `--two-stage` 約 2.5-5 分鐘）。
-若需要極致的身份保留（畫面每一幀都被參考圖控制），需改用 `ic-lora` + canny edge —
-此模式較重，尚未整合進 UI / CLI，計畫後續加入。
+**模式 B：雙錨 two-stage（既有）**
+- `ltx-2-mlx generate --two-stage --image PATH 0 1.0 --image PATH (frames-1) 1.0`
+- 鎖住首尾兩幀為同一張圖，CFG 引導中間幀
+- 中間幀仍可能飄移；身份保留中等
+
+CLI 切換：`gen.sh -I ic-lora` / `gen.sh -I two-stage`（預設前者）  
+UI 切換：全域 radio「i2v 識別保留模式」
 
 ## 授權
 
