@@ -39,6 +39,75 @@ I2V_MODES = {
     "雙錨 two-stage（既有，中等保留）": "two-stage-dual-anchor",
 }
 
+# 影片引擎切換（LTX 快 / Wan 慢但品質高）
+VIDEO_ENGINES = {
+    "LTX-2.3（本地，1-3 min/鏡，快）": "ltx",
+    "Wan 2.2（本地 bf16，10-30 min/鏡，品質更高）": "wan",
+}
+
+# Wan 2.2 模型路徑與解析度對應（aspect → w,h，皆為 16 倍數）
+WAN_MODEL_DIR = Path.home() / "wan2.2-mlx-bf16"
+WAN_ASPECT_WH = {
+    "16:9": (832, 480),
+    "9:16": (480, 832),
+    "1:1": (640, 640),
+    "21:9": (1024, 432),
+    "4:5": (544, 672),
+}
+WAN_FPS = 16  # Wan 2.2 VAE 訓練 fps，固定不可改
+
+
+def wan_frames(seconds: float) -> int:
+    """Wan 2.2 要 4n+1 幀。對齊到 fps=16 的目標秒數。"""
+    target = int(seconds * WAN_FPS)
+    n = max(1, round((target - 1) / 4))
+    return 1 + n * 4
+
+
+def build_wan_cmd(prompt: str, seconds: float, image: str, aspect: str,
+                   seed: int, out_path: Path) -> list[str]:
+    """構建 Wan 2.2 generate 命令（透過 mlx_video.wan_2.generate，需 Python 3.11）。
+
+    與 LTX 的差異：
+    - fps 固定 16
+    - frames 對齊 4n+1（LTX 是 1+8N）
+    - 解析度用 WAN_ASPECT_WH（與 LTX 不同的尺寸表）
+    - 沒有 distilled/--two-stage 等 mode 切換
+    - --image 可帶但僅單錨（無 ic-lora canny / 雙錨）
+    """
+    w, h = WAN_ASPECT_WH.get(aspect, (832, 480))
+    frames = wan_frames(seconds)
+    cmd = [
+        "uv", "run", "--python", "3.11",
+        "--with", "git+https://github.com/Blaizzy/mlx-video.git",
+        "mlx_video.wan_2.generate",
+        "--model-dir", str(WAN_MODEL_DIR),
+        "--prompt", prompt,
+        "--num-frames", str(frames),
+        "--width", str(w), "--height", str(h),
+        "--scheduler", "euler",
+        "--seed", str(int(seed)),
+        "--output-path", str(out_path),
+    ]
+    if image and image.strip() and Path(image).expanduser().exists():
+        cmd += ["--image", str(Path(image).expanduser())]
+    return cmd
+
+
+def is_wan_model_ready() -> tuple[bool, float]:
+    """檢查 Wan 2.2 模型是否完整下載。"""
+    if not WAN_MODEL_DIR.exists():
+        return False, 0.0
+    required = ["high_noise_model.safetensors", "low_noise_model.safetensors",
+                "t5_encoder.safetensors", "vae.safetensors"]
+    total = 0
+    for name in required:
+        p = WAN_MODEL_DIR / name
+        if not p.exists():
+            return False, 0.0
+        total += p.stat().st_size
+    return True, total / 1024**3
+
 
 def duration_to_frames(seconds: float, fps: int) -> int:
     """對齊到 1+8N，LTX-2 latent 時序壓縮要求。"""
@@ -576,6 +645,7 @@ def stream_story_pipeline(
     bgm_file_in=None, bgm_volume_in: float = -15.0,
     i2v_mode_label: str = list(I2V_MODES)[0],
     skip_image: bool = False,
+    video_engine_label: str = list(VIDEO_ENGINES)[0],
     progress=gr.Progress(),
 ):
     """每行 = 一鏡頭。對每行：FLUX 出圖 → LTX i2v 雙錨 → TTS+字幕 → concat。"""
@@ -674,8 +744,11 @@ def stream_story_pipeline(
             aspect, int(fps), mode_label,
             base_seed + i * 17, model, enhance, vid_path,
             i2v_mode=I2V_MODES.get(i2v_mode_label, "ic-lora-canny"),
+            video_engine=VIDEO_ENGINES.get(video_engine_label, "ltx"),
         )
-        if mode_tag == "ic-lora-canny":
+        if mode_tag.startswith("wan"):
+            log_lines.append(f"[2/3] Wan 2.2 ({mode_tag})")
+        elif mode_tag == "ic-lora-canny":
             log_lines.append(f"[2/3] LTX ic-lora canny 結構鎖")
         elif mode_tag == "two-stage-dual-anchor":
             log_lines.append(f"[2/3] LTX two-stage 雙錨")
@@ -799,7 +872,19 @@ def build_ic_lora_cmd(prompt: str, image_path: Path, control_video: Path,
 def build_cmd(prompt: str, seconds: float, image: str, aspect: str, fps: int,
               mode_label: str, seed: int, model: str, enhance: bool,
               out_path: Path, i2v_mode: str = "ic-lora-canny",
+              video_engine: str = "ltx",
               ) -> tuple[list[str], str]:
+    """構建影片生成命令。video_engine='ltx' 或 'wan'。
+
+    Wan 路徑：忽略 mode_label / i2v_mode / enhance（Wan CLI 不支援），
+    fps 固定 16，frames 對齊 4n+1。回傳 mode_tag='wan-t2v' 或 'wan-i2v'。
+    """
+    if video_engine == "wan":
+        has_image = bool(image and image.strip()
+                          and Path(image).expanduser().exists())
+        cmd = build_wan_cmd(prompt, seconds, image, aspect, seed, out_path)
+        return cmd, ("wan-i2v" if has_image else "wan-t2v")
+    # 預設 LTX 路徑：保留原本完整邏輯
     """構建 ltx-2-mlx 命令，依 i2v_mode 切換。
 
     回傳 (cmd, mode_tag)：
@@ -873,6 +958,7 @@ def build_cmd(prompt: str, seconds: float, image: str, aspect: str, fps: int,
 
 def stream_generate(df: pd.DataFrame, aspect, fps, mode_label, seed, model,
                     enhance, voice, burn_subtitle, i2v_mode_label,
+                    video_engine_label,
                     progress=gr.Progress()):
     """逐鏡呼叫 ltx-2-mlx，每鏡完成後做 TTS+字幕後處理（若有旁白文字）。"""
     if df is None or len(df) == 0:
@@ -904,7 +990,8 @@ def stream_generate(df: pd.DataFrame, aspect, fps, mode_label, seed, model,
         i2v_mode = I2V_MODES.get(i2v_mode_label, "ic-lora-canny")
         cmd, mode_tag = build_cmd(prompt, seconds, image, aspect, int(fps),
                                    mode_label, int(seed), model, enhance, out_path,
-                                   i2v_mode=i2v_mode)
+                                   i2v_mode=i2v_mode,
+                                   video_engine=VIDEO_ENGINES.get(video_engine_label, "ltx"))
 
         progress((i) / total, desc=f"Shot {i+1}/{total}: {prompt[:30]}")
         mode_desc = {"ic-lora-canny": " | ic-lora canny 結構鎖",
@@ -1231,6 +1318,16 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
     gr.Markdown("# LTX-2.3 Director")
 
     with gr.Accordion("全域設定（一般不用改）", open=False):
+        _wan_ok, _wan_gb = is_wan_model_ready()
+        _wan_label_suffix = (
+            f"  · Wan 模型: 已就緒 ({_wan_gb:.1f} GB)"
+            if _wan_ok else "  · Wan 模型: 未下載"
+        )
+        video_engine_select = gr.Radio(
+            choices=list(VIDEO_ENGINES),
+            value=list(VIDEO_ENGINES)[0],
+            label=f"影片引擎{_wan_label_suffix}",
+        )
         with gr.Row():
             aspect = gr.Dropdown(list(ASPECT_WH), value="16:9", label="畫面比例")
             fps = gr.Dropdown([24, 30, 60], value=24, label="FPS")
@@ -1774,14 +1871,15 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
         stream_story_pipeline,
         [story_text, story_style, story_custom_style, story_sec, story_motion,
          aspect, fps, seed, model, enhance, voice, burn_subtitle, mode,
-         bgm_file, bgm_volume, i2v_mode_select, skip_image_gen],
+         bgm_file, bgm_volume, i2v_mode_select, skip_image_gen,
+         video_engine_select],
         [story_log, completed_state, story_final_video, story_status],
     ).then(update_gallery_from_state, completed_state, shot_gallery)
 
     gen_btn.click(
         stream_generate,
         [storyboard, aspect, fps, mode, seed, model, enhance, voice, burn_subtitle,
-         i2v_mode_select],
+         i2v_mode_select, video_engine_select],
         [log_box, completed_state, final_video],
     ).then(update_gallery_from_state, completed_state, shot_gallery)
 
