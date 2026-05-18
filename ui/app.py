@@ -48,18 +48,14 @@ def duration_to_frames(seconds: float, fps: int) -> int:
 
 
 # Gradio Dropdown 接受 [(display, value), ...]：
-# value 是傳給 `say -v` 的完整名稱（zh_TW 語音與英文版同名需消除歧義）
-# 唯一例外：Meijia 名字本身就是唯一的，可直接用 "Meijia"
+# value 前綴指定 TTS engine：
+#   edge:XXX → Microsoft Edge TTS Neural（雲端免費，品質最高，需網路）
+#   say:XXX  → macOS 內建 say（本地離線，Meijia 之外品質普通）
 TTS_VOICES_ZH_TW = [
-    ("Meijia 美佳（女）", "Meijia"),
-    ("Sandy（女）", "Sandy (Chinese (Taiwan))"),
-    ("Shelley（女）", "Shelley (Chinese (Taiwan))"),
-    ("Flo（女）", "Flo (Chinese (Taiwan))"),
-    ("Grandma（老婦）", "Grandma (Chinese (Taiwan))"),
-    ("Eddy（男）", "Eddy (Chinese (Taiwan))"),
-    ("Reed（男）", "Reed (Chinese (Taiwan))"),
-    ("Rocko（男）", "Rocko (Chinese (Taiwan))"),
-    ("Grandpa（老翁）", "Grandpa (Chinese (Taiwan))"),
+    ("曉臻 HsiaoChen（女，Edge Neural，推薦）", "edge:zh-TW-HsiaoChenNeural"),
+    ("曉雨 HsiaoYu（女，Edge Neural）", "edge:zh-TW-HsiaoYuNeural"),
+    ("雲哲 YunJhe（男，Edge Neural）", "edge:zh-TW-YunJheNeural"),
+    ("美佳 Meijia（女，macOS 內建離線）", "say:Meijia"),
 ]
 
 DEFAULT_NARRATION_FONT = "/System/Library/Fonts/PingFang.ttc"
@@ -116,18 +112,54 @@ def adjust_duration_to_narration(seconds: float, narration: str,
     return seconds, aiff
 
 
-def tts_to_aiff(text: str, voice: str, out_path: Path) -> bool:
-    """用 macOS `say` 把文字合成為 AIFF。回傳是否成功。"""
-    if not text or not text.strip():
-        return False
+def _tts_say(text: str, voice_name: str, out_path: Path) -> bool:
+    """macOS 內建 say。輸出格式由 out_path 副檔名決定：.wav → 16-bit PCM，其他 → AIFF。"""
+    args = ["say", "-v", voice_name]
+    if out_path.suffix.lower() == ".wav":
+        args.append("--data-format=LEI16@22050")
+    args += ["-o", str(out_path), text.strip()]
     try:
-        subprocess.run(
-            ["say", "-v", voice, "-o", str(out_path), text.strip()],
-            check=True, capture_output=True, text=True, timeout=60,
-        )
+        subprocess.run(args, check=True, capture_output=True, text=True, timeout=60)
         return out_path.exists() and out_path.stat().st_size > 0
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return False
+
+
+def _tts_edge(text: str, voice_short: str, out_path: Path) -> bool:
+    """Microsoft Edge TTS Neural（雲端免費）。輸出 MP3。"""
+    try:
+        import asyncio
+        import edge_tts
+    except ImportError:
+        return False
+
+    async def _gen():
+        communicate = edge_tts.Communicate(text.strip(), voice_short)
+        await communicate.save(str(out_path))
+
+    try:
+        asyncio.run(_gen())
+        return out_path.exists() and out_path.stat().st_size > 0
+    except Exception:
+        return False
+
+
+def tts_to_aiff(text: str, voice: str, out_path: Path) -> bool:
+    """合成語音到 out_path。voice 值前綴決定 engine：
+       edge:zh-TW-HsiaoChenNeural → Edge Neural（雲端，輸出 MP3）
+       say:Meijia                 → macOS say（離線，輸出 AIFF/WAV 看副檔名）
+       無前綴 → 視為 say:VOICE（向下相容）
+
+    名稱保留 tts_to_aiff 是因為呼叫端把輸出檔當「TTS 結果音檔」處理；
+    實際格式取決於 engine，但 ffmpeg / 瀏覽器都能 auto-detect via magic bytes。
+    """
+    if not text or not text.strip() or not voice:
+        return False
+    if voice.startswith("edge:"):
+        return _tts_edge(text, voice[5:], out_path)
+    if voice.startswith("say:"):
+        return _tts_say(text, voice[4:], out_path)
+    return _tts_say(text, voice, out_path)
 
 
 def write_srt(text: str, duration: float, srt_path: Path) -> None:
@@ -1210,7 +1242,9 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
             enhance = gr.Checkbox(value=False, label="Gemma 改寫 prompt")
         with gr.Row():
             voice = gr.Dropdown(
-                TTS_VOICES_ZH_TW, value="Meijia", label="TTS 語音 (zh_TW)",
+                TTS_VOICES_ZH_TW,
+                value="edge:zh-TW-HsiaoChenNeural",
+                label="TTS 語音 (zh_TW)",
                 scale=2,
             )
             voice_preview_btn = gr.Button("試聽", size="sm", scale=1)
@@ -1219,27 +1253,19 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
             label="試聽結果", interactive=False, autoplay=True,
         )
 
-        def _preview_voice(voice_name):
-            """產出 WAV（瀏覽器原生支援；AIFF 不行）給 Gradio Audio 播。"""
-            if not voice_name:
+        def _preview_voice(voice_value):
+            """合成試聽：Edge → mp3，say → wav。瀏覽器都能播。"""
+            if not voice_value:
                 return None
             preview_dir = OUT_DIR / "_voice_preview"
             preview_dir.mkdir(exist_ok=True)
-            safe = re.sub(r"[^A-Za-z0-9]+", "_", voice_name).strip("_") or "voice"
-            out_wav = preview_dir / f"{safe}.wav"
+            safe = re.sub(r"[^A-Za-z0-9]+", "_", voice_value).strip("_") or "voice"
+            ext = ".mp3" if voice_value.startswith("edge:") else ".wav"
+            out_path = preview_dir / f"{safe}{ext}"
             sample = "你好，這是這個聲音的試聽範例。" \
                      "可以聽聽語速、音調和咬字是否合你的偏好。"
-            try:
-                subprocess.run(
-                    ["say", "-v", voice_name,
-                     "--data-format=LEI16@22050",
-                     "-o", str(out_wav), sample],
-                    check=True, capture_output=True, text=True, timeout=30,
-                )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                return None
-            if out_wav.exists() and out_wav.stat().st_size > 0:
-                return str(out_wav)
+            if tts_to_aiff(sample, voice_value, out_path):
+                return str(out_path)
             return None
 
         voice_preview_btn.click(_preview_voice, voice, voice_preview_audio)

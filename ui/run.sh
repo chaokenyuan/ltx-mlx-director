@@ -9,4 +9,4 @@ if [ ! -x "$HOME/ltx-2-mlx/.venv/bin/ltx-2-mlx" ]; then
   exit 1
 fi
 
-exec uv run --with "gradio>=4.36" --with pandas python ui/app.py
+exec uv run --with "gradio>=4.36" --with pandas --with edge-tts python ui/app.py
