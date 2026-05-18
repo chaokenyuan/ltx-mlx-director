@@ -34,6 +34,11 @@ MODE_FLAGS = {
     "hq (two-stages-hq, 約 5+ 分鐘)": "--two-stages-hq",
 }
 
+I2V_MODES = {
+    "ic-lora + canny（推薦，最強保留，最快）": "ic-lora-canny",
+    "雙錨 two-stage（既有，中等保留）": "two-stage-dual-anchor",
+}
+
 
 def duration_to_frames(seconds: float, fps: int) -> int:
     """對齊到 1+8N，LTX-2 latent 時序壓縮要求。"""
@@ -335,6 +340,7 @@ def stream_story_pipeline(
     aspect: str, fps, seed, model: str, enhance: bool,
     voice: str, burn_subtitle: bool, mode_label: str,
     bgm_file_in=None, bgm_volume_in: float = -15.0,
+    i2v_mode_label: str = list(I2V_MODES)[0],
     progress=gr.Progress(),
 ):
     """每行 = 一鏡頭。對每行：FLUX 出圖 → LTX i2v 雙錨 → TTS+字幕 → concat。"""
@@ -414,11 +420,16 @@ def stream_story_pipeline(
         log_lines.append(f"[2/3] LTX i2v: {motion}")
         yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: 動畫中"
 
-        ltx_cmd, _i2v_lock = build_cmd(
+        ltx_cmd, mode_tag = build_cmd(
             motion, actual_sec, str(img_path),
             aspect, int(fps), mode_label,
             base_seed + i * 17, model, enhance, vid_path,
+            i2v_mode=I2V_MODES.get(i2v_mode_label, "ic-lora-canny"),
         )
+        if mode_tag == "ic-lora-canny":
+            log_lines.append(f"[2/3] LTX ic-lora canny 結構鎖")
+        elif mode_tag == "two-stage-dual-anchor":
+            log_lines.append(f"[2/3] LTX two-stage 雙錨")
         rc_ltx = None
         for item in _stream_subprocess(ltx_cmd, log_lines, cwd=str(REPO_DIR)):
             if isinstance(item, int):
@@ -459,28 +470,125 @@ def stream_story_pipeline(
     yield "\n".join(log_lines[-40:]), completed, final_path, f"完成: {concat_msg}"
 
 
+# ============================================================
+# ic-lora + canny 結構鎖定（最強身份保留）
+# ============================================================
+
+IC_LORA_UNION_CONTROL = "Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control"
+
+
+def generate_canny_control(image_path: Path, width: int, height: int,
+                            frames: int, fps: int, out_path: Path) -> bool:
+    """從靜圖產生 canny 邊緣的控制影片（同一張圖複製 N 幀）。
+
+    上游 ltx-2-mlx static-scene I2V recipe 的標準做法：
+    - scale + crop 到目標尺寸
+    - edgedetect=mode=canny 取邊
+    - yuv420p 格式輸出
+    """
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-loop", "1", "-i", str(image_path),
+        "-vf", (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},"
+            "edgedetect=mode=canny:low=0.1:high=0.4,"
+            "format=yuv420p"
+        ),
+        "-frames:v", str(frames),
+        "-r", str(fps),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        str(out_path),
+    ]
+    subprocess.run(cmd, capture_output=True, text=True)
+    return out_path.exists() and out_path.stat().st_size > 0
+
+
+def build_ic_lora_cmd(prompt: str, image_path: Path, control_video: Path,
+                      width: int, height: int, frames: int, fps: int,
+                      seed: int, model: str, out_path: Path,
+                      lora_repo: str = IC_LORA_UNION_CONTROL) -> list[str]:
+    """構建 ltx-2-mlx ic-lora 命令，使用 Union Control + canny 控制每一幀。
+
+    這是上游推薦的 static-scene identity preservation pattern，整段影片
+    身份完全保留（vs --two-stage 雙錨只保首尾）。
+    比 --two-stage 快 4×（distilled defaults: 8+3 steps, no CFG）。
+    """
+    return [
+        str(LTX_BIN), "ic-lora",
+        "-p", prompt,
+        "--lora", lora_repo, "1.0",
+        "--video-conditioning", str(control_video), "1.0",
+        "--image", str(image_path),
+        "--low-ram",
+        "--width", str(width), "--height", str(height),
+        "--frames", str(frames),
+        "--frame-rate", str(fps),
+        "--seed", str(int(seed)),
+        "--model", model,
+        "-o", str(out_path),
+    ]
+
+
 def build_cmd(prompt: str, seconds: float, image: str, aspect: str, fps: int,
               mode_label: str, seed: int, model: str, enhance: bool,
-              out_path: Path) -> tuple[list[str], bool]:
-    """構建 ltx-2-mlx generate 命令。
+              out_path: Path, i2v_mode: str = "ic-lora-canny",
+              ) -> tuple[list[str], str]:
+    """構建 ltx-2-mlx 命令，依 i2v_mode 切換。
 
-    回傳 (cmd, used_i2v_lock)，後者用於 UI 顯示「i2v 強鎖定」狀態。
+    回傳 (cmd, mode_tag)：
+      mode_tag in {"ic-lora-canny", "two-stage-dual-anchor", "t2v"}
 
-    參考圖識別保留策略：
-    當提供 --image 時，原本 --distilled 模式因為 no CFG，圖只在第 0 幀短暫出現後
-    立刻飄走（LTX-2.3 上游已知特性）。改用 --one-stage（含 CFG，q4 模型支援），
-    並加上頭尾雙錨：--image PATH 0 1.0 + --image PATH (frames-1) 1.0，
-    可大幅提升整支影片對參考圖的忠實度。
+    模式：
+      - ic-lora-canny：有圖時，從圖生 canny 控制影片，跑 ic-lora（最強身份保留，
+        上游 static-scene I2V recipe，比 two-stage 快 4×）
+      - two-stage-dual-anchor：有圖時跑 --two-stage + 頭尾雙錨（中等保留）
+      - 無圖：用 mode_label (distilled / two-stages-hq) 做純 t2v
+
+    注意 ic-lora 模式會在 out_path 同目錄寫一個 *_canny.mp4 控制影片。
     """
     w, h = ASPECT_WH[aspect]
     frames = duration_to_frames(seconds, fps)
 
     has_image = bool(image and image.strip()
                      and Path(image).expanduser().exists())
-    # 注意：--one-stage 不支援多錨點 i2v（只能單張單錨），所以有圖時改用 --two-stage
-    # 雖然 help 寫 --two-stage 「requires q8」，實測 q4 也可正常執行。
-    pipe = "--two-stage" if has_image else MODE_FLAGS[mode_label]
 
+    if has_image and i2v_mode == "ic-lora-canny":
+        img_path = Path(image).expanduser()
+        control_video = out_path.parent / f"{out_path.stem}_canny.mp4"
+        if generate_canny_control(img_path, w, h, frames, int(fps), control_video):
+            cmd = build_ic_lora_cmd(
+                prompt, img_path, control_video,
+                w, h, frames, int(fps), int(seed), model, out_path,
+            )
+            if enhance:
+                cmd += ["--enhance-prompt"]
+            return cmd, "ic-lora-canny"
+        # canny 失敗則 fallthrough 到 two-stage
+
+    if has_image:
+        # 雙錨 two-stage：--one-stage 不支援多錨，--two-stage 雖然 help 寫 requires q8 但 q4 實測可用
+        pipe = "--two-stage"
+        cmd = [
+            str(LTX_BIN), "generate",
+            "-p", prompt,
+            pipe, "--low-ram",
+            "--width", str(w), "--height", str(h),
+            "--frames", str(frames),
+            "--frame-rate", str(fps),
+            "--seed", str(int(seed)),
+            "--model", model,
+            "-o", str(out_path),
+        ]
+        img_path = str(Path(image).expanduser())
+        cmd += ["--image", img_path, "0", "1.0"]
+        cmd += ["--image", img_path, str(frames - 1), "1.0"]
+        if enhance:
+            cmd += ["--enhance-prompt"]
+        return cmd, "two-stage-dual-anchor"
+
+    # 純 t2v
+    pipe = MODE_FLAGS[mode_label]
     cmd = [
         str(LTX_BIN), "generate",
         "-p", prompt,
@@ -492,18 +600,14 @@ def build_cmd(prompt: str, seconds: float, image: str, aspect: str, fps: int,
         "--model", model,
         "-o", str(out_path),
     ]
-    if has_image:
-        img_path = str(Path(image).expanduser())
-        # 雙端錨點：第 0 幀 + 最後 1 幀皆鎖在同一張參考圖
-        cmd += ["--image", img_path, "0", "1.0"]
-        cmd += ["--image", img_path, str(frames - 1), "1.0"]
     if enhance:
         cmd += ["--enhance-prompt"]
-    return cmd, has_image
+    return cmd, "t2v"
 
 
 def stream_generate(df: pd.DataFrame, aspect, fps, mode_label, seed, model,
-                    enhance, voice, burn_subtitle, progress=gr.Progress()):
+                    enhance, voice, burn_subtitle, i2v_mode_label,
+                    progress=gr.Progress()):
     """逐鏡呼叫 ltx-2-mlx，每鏡完成後做 TTS+字幕後處理（若有旁白文字）。"""
     if df is None or len(df) == 0:
         yield "請先新增至少一個鏡頭", [], None
@@ -531,11 +635,17 @@ def stream_generate(df: pd.DataFrame, aspect, fps, mode_label, seed, model,
             continue
 
         out_path = OUT_DIR / f"{base}_{int(i)+1:02d}.mp4"
-        cmd, i2v_lock = build_cmd(prompt, seconds, image, aspect, int(fps),
-                                   mode_label, int(seed), model, enhance, out_path)
+        i2v_mode = I2V_MODES.get(i2v_mode_label, "ic-lora-canny")
+        cmd, mode_tag = build_cmd(prompt, seconds, image, aspect, int(fps),
+                                   mode_label, int(seed), model, enhance, out_path,
+                                   i2v_mode=i2v_mode)
 
         progress((i) / total, desc=f"Shot {i+1}/{total}: {prompt[:30]}")
-        lock_tag = " | i2v鎖定(two-stage+雙端錨)" if i2v_lock else ""
+        mode_desc = {"ic-lora-canny": " | ic-lora canny 結構鎖",
+                     "two-stage-dual-anchor": " | two-stage 雙錨",
+                     "t2v": ""}.get(mode_tag, "")
+        lock_tag = mode_desc
+        i2v_lock = mode_tag != "t2v"
         narr_tag = " | 旁白" if narration else ""
         log_lines.append(f"\n=== Shot {i+1}/{total} | {seconds}s | {aspect}{lock_tag}{narr_tag} ===")
         log_lines.append(f"Prompt: {prompt}")
@@ -870,6 +980,13 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
         )
         burn_subtitle = gr.Checkbox(
             value=True, label="燒入字幕（中文 PingFang）",
+        )
+    with gr.Row():
+        i2v_mode_select = gr.Radio(
+            choices=list(I2V_MODES),
+            value=list(I2V_MODES)[0],
+            label="i2v 識別保留模式（有參考圖時生效）",
+            info="ic-lora 用 canny 邊緣控制每一幀，全程身份鎖定，比 two-stage 快；首次跑會下載 Union Control LoRA 權重",
         )
     with gr.Accordion("背景音樂（選填，會在最終 concat 後混入）", open=False):
         with gr.Row():
@@ -1236,13 +1353,14 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
         stream_story_pipeline,
         [story_text, story_style, story_custom_style, story_sec, story_motion,
          aspect, fps, seed, model, enhance, voice, burn_subtitle, mode,
-         bgm_file, bgm_volume],
+         bgm_file, bgm_volume, i2v_mode_select],
         [story_log, completed_state, story_final_video, story_status],
     ).then(update_gallery_from_state, completed_state, shot_gallery)
 
     gen_btn.click(
         stream_generate,
-        [storyboard, aspect, fps, mode, seed, model, enhance, voice, burn_subtitle],
+        [storyboard, aspect, fps, mode, seed, model, enhance, voice, burn_subtitle,
+         i2v_mode_select],
         [log_box, completed_state, final_video],
     ).then(update_gallery_from_state, completed_state, shot_gallery)
 
