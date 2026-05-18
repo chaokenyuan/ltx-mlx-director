@@ -442,8 +442,10 @@ def list_v3ctor_articles(limit: int = 50) -> list[dict]:
     except Exception:
         return []
 
+    # sitemap entry 結構：<url><loc>...</loc><lastmod>...</lastmod><changefreq>...
+    # 不能要求 </url> 結尾（中間還有 changefreq/priority）；只配對到 lastmod 即可
     entries = re.findall(
-        r"<url>\s*<loc>([^<]+)</loc>\s*<lastmod>([^<]+)</lastmod>\s*</url>",
+        r"<loc>([^<]+)</loc>\s*<lastmod>([^<]+)</lastmod>",
         xml,
     )
     result: list[dict] = []
