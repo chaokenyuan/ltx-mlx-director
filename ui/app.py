@@ -366,6 +366,20 @@ def scrape_v3ctor(url: str) -> dict:
     }
 
 
+_CLOSING_QUOTES = "」』）】"
+
+
+def _merge_orphan_closers(shots: list[str]) -> list[str]:
+    """中文引號 / 括號的關閉符若被分到下一鏡開頭，合回前一鏡。"""
+    out: list[str] = []
+    for s in shots:
+        if out and s and s[0] in _CLOSING_QUOTES:
+            out[-1] = out[-1] + s
+        else:
+            out.append(s)
+    return out
+
+
 def split_to_shots(text: str, mode: str, target_chars: int = 35) -> list[str]:
     """把長文拆成多鏡，每鏡一行（給 Tab 0 story_text 用）。
 
@@ -373,20 +387,24 @@ def split_to_shots(text: str, mode: str, target_chars: int = 35) -> list[str]:
       段落 - 每段一鏡（粗）
       句子 - 每句一鏡（細）
       智能 - 合併短句到 target_chars 字上限（平衡）
+
+    所有模式都會做關閉符（」』）】）的孤兒修正。
     """
     if not text:
         return []
     if mode == "段落":
-        return [p.strip() for p in text.split("\n\n") if p.strip()]
+        return _merge_orphan_closers(
+            [p.strip() for p in text.split("\n\n") if p.strip()]
+        )
     if mode == "句子":
         parts = re.split(r"(?<=[。！？.!?])\s*", text)
-        return [s.strip() for s in parts if s.strip()]
+        return _merge_orphan_closers([s.strip() for s in parts if s.strip()])
     # 智能
     parts = re.split(r"(?<=[。！？.!?])\s*", text)
+    parts = _merge_orphan_closers([s.strip() for s in parts if s.strip()])
     shots: list[str] = []
     cur = ""
     for s in parts:
-        s = s.strip()
         if not s:
             continue
         if cur and (len(cur) + len(s)) > target_chars:
