@@ -205,14 +205,22 @@ def post_process_shot(shot_video: Path, narration: str, duration: float,
 # ============================================================
 
 FLUX_MODELS = {
-    "schnell (快, 4 steps)": ("schnell", 4),
-    "dev (慢, 25 steps，更精細)": ("dev", 25),
+    "z-image-turbo（開放，快，推薦）": ("z-image-turbo", 8),
+    "z-image（開放，較精細）": ("z-image", 30),
+    "schnell (FLUX.1-schnell，需 HF 接受授權)": ("schnell", 4),
+    "dev (FLUX.1-dev，需 HF 接受授權)": ("dev", 25),
 }
 
 
 def build_flux_cmd(prompt: str, model_key: str, aspect: str,
                    seed: int, out_path: Path) -> list[str]:
-    """構建 mflux-generate 命令。"""
+    """構建 mflux-generate 命令。
+
+    FLUX.1 系列是 gated repo（匿名 401）；若選 schnell/dev，需先：
+    1. https://huggingface.co/black-forest-labs/FLUX.1-schnell 同意授權
+    2. huggingface-cli login（或設 HF_TOKEN env var）
+    z-image / z-image-turbo 為開放權重，不需登入。
+    """
     model, steps = FLUX_MODELS[model_key]
     w, h = ASPECT_WH[aspect]
     cmd = [
@@ -223,11 +231,25 @@ def build_flux_cmd(prompt: str, model_key: str, aspect: str,
         "--steps", str(steps),
         "--seed", str(int(seed)) if int(seed) >= 0 else "0",
         "--width", str(w), "--height", str(h),
-        "--quantize", "4",
         "--low-ram",
         "--output", str(out_path),
     ]
+    # FLUX 系列支援 q4 量化以省記憶體
+    if model in ("schnell", "dev"):
+        cmd += ["--quantize", "4"]
     return cmd
+
+
+def _flux_error_hint(log_text: str) -> str:
+    """從 log 偵測常見錯誤並回傳可執行的提示。"""
+    if "401" in log_text or "GatedRepoError" in log_text or "Unauthorized" in log_text:
+        return (
+            "\n        提示：FLUX.1 是 gated repo。請改選「z-image-turbo（開放）」，"
+            "或先到 https://huggingface.co/black-forest-labs/FLUX.1-schnell "
+            "接受授權，然後跑 `huggingface-cli login`（會把 token 存到 "
+            "~/.cache/huggingface/token），重啟 UI 即可。"
+        )
+    return ""
 
 
 def stream_flux(prompt: str, model_key: str, count: int, aspect: str,
@@ -273,7 +295,8 @@ def stream_flux(prompt: str, model_key: str, count: int, aspect: str,
             produced.append(str(out_path))
             log_lines.append(f"   -> 完成: {out_path.name}")
         else:
-            log_lines.append(f"   -> 失敗 exit={p.returncode}")
+            hint = _flux_error_hint("\n".join(log_lines[-12:]))
+            log_lines.append(f"   -> 失敗 exit={p.returncode}{hint}")
         yield "\n".join(log_lines[-30:]), produced, f"已產出 {len(produced)} 張"
 
     progress(1.0, desc="完成")
@@ -410,8 +433,9 @@ def stream_story_pipeline(
                 yield item, completed, None, f"Shot {shot_idx}: 生圖中"
 
         if not (img_path.exists() and img_path.stat().st_size > 0):
-            log_lines.append(f"[1/3] FLUX 失敗 rc={rc_flux}，跳過此鏡")
-            yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: 失敗"
+            hint = _flux_error_hint("\n".join(log_lines[-15:]))
+            log_lines.append(f"[1/3] FLUX 失敗 rc={rc_flux}，跳過此鏡{hint}")
+            yield "\n".join(log_lines[-40:]), completed, None, f"Shot {shot_idx}: FLUX 失敗"
             continue
         log_lines.append(f"[1/3] FLUX 完成: {img_path.name}")
 
@@ -1092,11 +1116,13 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
 
             gr.Markdown(
                 "**內部流程（每鏡）**\n"
-                "1. FLUX schnell 生圖（約 30 秒/張，首跑下載 ~6GB）\n"
-                "2. LTX `--two-stage` 頭尾雙錨 i2v（約 2-3 分/鏡）\n"
-                "3. macOS `say` 出 TTS aiff + ffmpeg 燒中文字幕 + mux 音軌\n"
-                "4. 全部完成後 ffmpeg concat 為最終 mp4\n\n"
-                "想細調個別鏡頭：切到 **手動分鏡** Tab，分鏡內容已分享到那邊。"
+                "1. 預跑 TTS 取得旁白實際秒數（若超過設定值自動延長鏡頭）\n"
+                "2. 靜圖生成（預設 z-image-turbo，開放權重）\n"
+                "3. LTX ic-lora canny 結構鎖 i2v（首尾每幀全程鎖定身份）\n"
+                "4. macOS `say` 出 TTS aiff + ffmpeg 燒中文字幕 + mux 音軌\n"
+                "5. 全部完成後 ffmpeg concat 為最終 mp4（可選背景音樂混入）\n\n"
+                "靜圖預設 z-image-turbo（無需登入）；想用 FLUX 請先到 Tab 3 看登入說明。\n"
+                "想細調個別鏡頭：切到 **手動分鏡** Tab，分鏡內容已分享。"
             )
 
         # ============================== Tab 1: 分鏡腳本 ==============================
@@ -1283,12 +1309,17 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
             )
 
         # ============================ Tab 3: AI 靜圖 ==============================
-        with gr.Tab("AI 靜圖（FLUX）"):
+        with gr.Tab("AI 靜圖（FLUX / Z-Image）"):
             gr.Markdown(
-                "用本地 **FLUX.1**（透過 `mflux`）生成分鏡靜圖，無需 Midjourney "
-                "訂閱。圖會存到 `~/ltx-2-mlx/output/`，可直接拖到 Tab 1 i2v 區或 "
-                "Tab 2 關鍵幀串接區。\n\n"
-                "首次跑會下載 FLUX.1 權重（schnell ~6GB / dev ~12GB，4-bit 量化版）。"
+                "用本地 mflux 生成分鏡靜圖，無需 Midjourney 訂閱。\n\n"
+                "**模型選擇**：\n"
+                "- **z-image-turbo / z-image**（推薦）：開放權重，無需 HF 登入。"
+                "z-image-turbo 約 8 步，速度與 FLUX.1-schnell 相當。\n"
+                "- **FLUX.1-schnell / dev**：**需 HF 授權**。"
+                "請先到 https://huggingface.co/black-forest-labs/FLUX.1-schnell "
+                "點「Agree and access repository」，再執行 `huggingface-cli login`，"
+                "重啟 UI 才能下載。匿名嘗試會 401 Gated。\n\n"
+                "首次跑會下載對應權重，存到 `~/.cache/huggingface/hub/`。"
             )
 
             with gr.Row():
