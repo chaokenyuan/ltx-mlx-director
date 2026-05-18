@@ -47,8 +47,20 @@ def duration_to_frames(seconds: float, fps: int) -> int:
     return 1 + n * 8
 
 
-TTS_VOICES_ZH_TW = ["Meijia", "Sandy", "Eddy", "Flo", "Rocko",
-                    "Grandma", "Grandpa", "Reed"]
+# Gradio Dropdown 接受 [(display, value), ...]：
+# value 是傳給 `say -v` 的完整名稱（zh_TW 語音與英文版同名需消除歧義）
+# 唯一例外：Meijia 名字本身就是唯一的，可直接用 "Meijia"
+TTS_VOICES_ZH_TW = [
+    ("Meijia 美佳（女）", "Meijia"),
+    ("Sandy（女）", "Sandy (Chinese (Taiwan))"),
+    ("Shelley（女）", "Shelley (Chinese (Taiwan))"),
+    ("Flo（女）", "Flo (Chinese (Taiwan))"),
+    ("Grandma（老婦）", "Grandma (Chinese (Taiwan))"),
+    ("Eddy（男）", "Eddy (Chinese (Taiwan))"),
+    ("Reed（男）", "Reed (Chinese (Taiwan))"),
+    ("Rocko（男）", "Rocko (Chinese (Taiwan))"),
+    ("Grandpa（老翁）", "Grandpa (Chinese (Taiwan))"),
+]
 
 DEFAULT_NARRATION_FONT = "/System/Library/Fonts/PingFang.ttc"
 
@@ -1213,7 +1225,8 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
                 return None
             preview_dir = OUT_DIR / "_voice_preview"
             preview_dir.mkdir(exist_ok=True)
-            out_wav = preview_dir / f"{voice_name}.wav"
+            safe = re.sub(r"[^A-Za-z0-9]+", "_", voice_name).strip("_") or "voice"
+            out_wav = preview_dir / f"{safe}.wav"
             sample = "你好，這是這個聲音的試聽範例。" \
                      "可以聽聽語速、音調和咬字是否合你的偏好。"
             try:
