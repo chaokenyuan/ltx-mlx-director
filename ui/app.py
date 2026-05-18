@@ -1121,10 +1121,10 @@ with gr.Blocks(title="LTX-2.3 Director") as app:
 
             with gr.Row():
                 skip_image_gen = gr.Checkbox(
-                    value=False,
-                    label="跳過靜圖生成（純 t2v，最穩定）",
-                    info="勾選 → 直接用 LTX 文字轉影片，跳過 FLUX/Z-Image 階段。"
-                          "適合：mflux 靜圖出問題、或不想下載額外模型時。",
+                    value=True,
+                    label="純 t2v 模式（推薦預設，免裝靜圖模型）",
+                    info="預設勾選 → 直接 LTX 文字轉影片，最穩定可用。"
+                          "取消勾選才會跑 FLUX/Z-Image 生圖（要 HF 登入或撞 mflux bug）。",
                 )
 
             story_run_btn = gr.Button(
